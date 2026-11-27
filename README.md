@@ -1,2 +1,2 @@
-# DigiCost
-数字化工具
+# Ben-Pake
+桌面端打包工具
