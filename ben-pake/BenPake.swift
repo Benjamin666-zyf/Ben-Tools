@@ -16,6 +16,7 @@ struct BenPakeApp: App {
 
 @MainActor
 private final class BuildForm: ObservableObject {
+    @Published var search = ""
     @Published var website = ""
     @Published var name = ""
     @Published var width = "1200"
@@ -112,7 +113,7 @@ private struct BuildView: View {
     }
 
     private var visibleSites: [GallerySite] {
-        let query = form.website.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = form.search.trimmingCharacters(in: .whitespacesAndNewlines)
         return catalog.filter { site in
             (form.category == .all || site.category == form.category.rawValue)
             && (query.isEmpty || site.title.localizedCaseInsensitiveContains(query)
@@ -124,12 +125,12 @@ private struct BuildView: View {
         VStack(alignment: .leading, spacing: 18) {
             Text("选择要打包的网站").font(.title.bold()).accessibilityAddTraits(.isHeader)
             HStack {
-                TextField("网站网址或名称", text: $form.website, prompt: Text("粘贴网址或搜索网站"))
+                TextField("网站网址或名称", text: $form.search, prompt: Text("粘贴网址或搜索网站"))
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(openWebsite)
                 Button("使用网址", action: openWebsite)
                     .buttonStyle(.borderedProminent)
-                    .disabled(form.website.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || form.status.isBuilding)
+                    .disabled(form.search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || form.status.isBuilding)
             }
             Picker("分类", selection: $form.category) {
                 ForEach(GalleryCategory.allCases) { category in Text(category.title).tag(category) }
@@ -162,15 +163,13 @@ private struct BuildView: View {
     }
 
     private func openWebsite() {
-        guard !form.website.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !form.status.isBuilding else { return }
-        if let site = form.selectedSite, site.url != form.website {
+        let website = form.search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !website.isEmpty, !form.status.isBuilding else { return }
+        if website != form.website {
+            form.website = website
             form.selectedSite = nil
             form.icon = nil
-            form.name = ""
-        }
-        if form.name.isEmpty {
-            form.name = URLComponents(string: form.website)?.host ?? ""
+            form.name = URLComponents(string: website)?.host ?? ""
         }
         form.section = .settings
     }
@@ -196,7 +195,9 @@ private struct BuildView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     card("基本信息") {
                         TextField("网站网址", text: $form.website, prompt: Text("https://example.com"))
+                            .accessibilityLabel("网站网址")
                         TextField("应用名称", text: $form.name)
+                            .accessibilityLabel("应用名称")
                         LabeledContent("图标") {
                             HStack {
                                 Text(form.icon?.lastPathComponent ?? "来自网站").lineLimit(1).foregroundStyle(.secondary)

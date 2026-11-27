@@ -128,7 +128,7 @@ struct Builder: Sendable {
         try process.run()
         try stderr.fileHandleForWriting.close()
 
-        let lastLog = try streamLog(stderr.fileHandleForReading, to: log)
+        let lastLog = streamLog(stderr.fileHandleForReading, to: log)
         process.waitUntilExit()
 
         let result = try? JSONDecoder().decode(CLIResult.self, from: Data(contentsOf: stdout))
@@ -173,10 +173,12 @@ private struct CLIResult: Decodable {
     let error: Failure?
 }
 
-private func streamLog(_ handle: FileHandle, to log: (String) -> Void) throws -> String {
+private func streamLog(_ handle: FileHandle, to log: (String) -> Void) -> String {
     var pending = Data()
     var last = ""
-    while let chunk = try handle.read(upToCount: 4096), !chunk.isEmpty {
+    while true {
+        let chunk = handle.availableData
+        if chunk.isEmpty { break }
         pending.append(chunk)
         while let newline = pending.firstIndex(of: 10) {
             last = String(decoding: pending[..<newline], as: UTF8.self)
