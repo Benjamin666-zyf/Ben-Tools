@@ -1,0 +1,34 @@
+#[cfg(target_os = "macos")]
+pub mod auth;
+pub mod autostart;
+#[cfg(any(target_os = "linux", test))]
+pub mod color_scheme;
+pub mod config;
+#[cfg(feature = "content-blocking")]
+pub mod content_blocking;
+#[cfg(target_os = "windows")]
+pub mod download;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod extensions;
+#[cfg(target_os = "linux")]
+pub mod header_bar;
+pub mod invoke;
+pub mod local_site;
+#[cfg(target_os = "linux")]
+pub mod media_permission;
+#[cfg(target_os = "macos")]
+pub mod menu;
+#[cfg(target_os = "macos")]
+pub mod nav_buttons;
+pub mod navigation;
+pub mod notification;
+pub mod passkey;
+#[cfg(target_os = "macos")]
+pub mod popup_close;
+pub mod recovery;
+#[cfg(target_os = "macos")]
+pub mod script_dialogs;
+pub mod setup;
+#[cfg(target_os = "macos")]
+pub mod tab_bar;
+pub mod window;

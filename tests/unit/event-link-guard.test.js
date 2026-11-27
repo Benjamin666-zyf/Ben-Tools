@@ -1,0 +1,1537 @@
+import fs from "fs";
+import path from "path";
+import { runInNewContext } from "node:vm";
+import { describe, expect, it, vi } from "vitest";
+
+function loadEventHelpers({
+  withTauri = false,
+  userAgent = "Mozilla/5.0",
+  initialZoom = null,
+  downloadError = null,
+  nativeDownloads = false,
+  topWindow = null,
+  opener = null,
+  nativeClose = () => {},
+} = {}) {
+  const source = ["link_policy.js", "event.js"]
+    .map((file) =>
+      fs.readFileSync(
+        path.join(process.cwd(), "src-tauri/src/inject", file),
+        "utf-8",
+      ),
+    )
+    .join("\n");
+
+  const invokeCalls = [];
+  const nativeDownloadClicks = [];
+  const invoke = (command, payload) => {
+    invokeCalls.push([command, payload]);
+    if (command === "download_file" && downloadError)
+      return Promise.reject(downloadError);
+    return Promise.resolve();
+  };
+  const eventListeners = {};
+  const elementsById = new Map();
+  const localStorageValues = new Map();
+  if (initialZoom !== null) {
+    localStorageValues.set("htmlZoom", initialZoom);
+  }
+  const registerListener = (type, handler, options) => {
+    eventListeners[type] = eventListeners[type] || [];
+    eventListeners[type].push({ handler, options });
+  };
+  const createElement = (tagName = "div") => ({
+    tagName: tagName.toUpperCase(),
+    style: {},
+    children: [],
+    addEventListener: () => {},
+    appendChild(child) {
+      this.children.push(child);
+      if (child.id) elementsById.set(child.id, child);
+    },
+    removeChild(child) {
+      this.children = this.children.filter((item) => item !== child);
+      if (child.id) elementsById.delete(child.id);
+    },
+    click() {
+      nativeDownloadClicks.push([this.href, this.download]);
+      // A transient native-download anchor still passes through document capture.
+      getClickGuard({ eventListeners })(makeClickEvent(this));
+    },
+    closest() {
+      return this;
+    },
+    getAttribute(name) {
+      return name === "href" ? this.href : "";
+    },
+    set id(value) {
+      this._id = value;
+      elementsById.set(value, this);
+    },
+    get id() {
+      return this._id;
+    },
+  });
+  const body = createElement("body");
+  body.scrollHeight = 0;
+
+  const context = {
+    console,
+    URL,
+    Event,
+    EventTarget,
+    Notification: function Notification() {},
+    setTimeout,
+    clearTimeout,
+    scrollTo: () => {},
+    navigator: {
+      userAgent,
+      language: "en-US",
+    },
+    window: {
+      frames: [],
+      history: {
+        back: () => {},
+        forward: () => {},
+      },
+      location: {
+        href: "https://example.com/app",
+        origin: "https://example.com",
+        pathname: "/app",
+        reload: () => {},
+      },
+      localStorage: {
+        getItem: (key) => localStorageValues.get(key) ?? null,
+        setItem: (key, value) => {
+          localStorageValues.set(key, value);
+        },
+      },
+      addEventListener: registerListener,
+      dispatchEvent: () => {},
+      open: () => ({}),
+      opener,
+      close: nativeClose,
+      isAuthLink: () => false,
+      isAuthPopup: () => false,
+      pakeConfig: {},
+      pakeNativeDownloads: nativeDownloads,
+    },
+    document: {
+      addEventListener: registerListener,
+      createElement,
+      getElementById: (id) => elementsById.get(id) || null,
+      getElementsByTagName: () => [{ style: {} }],
+      body,
+      execCommand: () => {},
+    },
+  };
+  context.window.navigator = context.navigator;
+  context.window.top = topWindow || context.window;
+  if (withTauri) {
+    context.window.__PAKE_NATIVE__ = {
+      core: { invoke },
+      window: {
+        getCurrentWindow: () => ({
+          startDragging: () => {},
+          isFullscreen: () => Promise.resolve(false),
+          setFullscreen: () => {},
+        }),
+      },
+    };
+  }
+
+  runInNewContext(source, context);
+  return {
+    ...context,
+    eventListeners,
+    invokeCalls,
+    localStorageValues,
+    nativeDownloadClicks,
+  };
+}
+
+function runDomReady(context) {
+  context.eventListeners.DOMContentLoaded[0].handler();
+}
+
+function getClickGuard(context) {
+  return context.eventListeners.click.find(
+    ({ handler }) => handler.name === "detectAnchorElementClick",
+  ).handler;
+}
+
+function makeAnchor(href, target = "_blank") {
+  return {
+    href,
+    target,
+    download: "",
+    getAttribute: (name) => (name === "href" ? href : ""),
+  };
+}
+
+function makeClickEvent(anchor) {
+  return {
+    target: {
+      closest: () => anchor,
+    },
+    preventDefault: vi.fn(),
+    stopImmediatePropagation: vi.fn(),
+  };
+}
+
+describe("event link guard", () => {
+  it("uses native Windows downloads once for same-origin files without IPC", () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      nativeDownloads: true,
+    });
+    runDomReady(context);
+    const anchor = makeAnchor("https://example.com/report.pdf", "_self");
+    anchor.download = "report.pdf";
+    const click = makeClickEvent(anchor);
+    getClickGuard(context)(click);
+    expect(click.preventDefault).toHaveBeenCalledOnce();
+    expect(context.nativeDownloadClicks).toEqual([[anchor.href, "report.pdf"]]);
+    expect(
+      context.invokeCalls.filter(([command]) => command === "download_file"),
+    ).toEqual([]);
+  });
+
+  it("keeps cross-origin forced downloads on HTTP when the browser may preview them", () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      nativeDownloads: true,
+    });
+    runDomReady(context);
+    const anchor = makeAnchor("https://cdn.example.com/report.pdf", "_self");
+    anchor.download = "report.pdf";
+    getClickGuard(context)(makeClickEvent(anchor));
+    expect(context.nativeDownloadClicks).toEqual([]);
+    expect(
+      context.invokeCalls.filter(([command]) => command === "download_file"),
+    ).toEqual([
+      [
+        "download_file",
+        {
+          params: {
+            url: anchor.href,
+            filename: "report.pdf",
+            language: "en-US",
+            user_agent: "Mozilla/5.0",
+            page_url: "https://example.com/app",
+          },
+        },
+      ],
+    ]);
+  });
+
+  it.each([
+    'download_file not allowed on window "pake", webview "pake", URL: https://other.example/',
+    "Command download_file not allowed by ACL",
+  ])(
+    "falls back once to browser downloads on ACL denial: %s",
+    async (downloadError) => {
+      const context = loadEventHelpers({ withTauri: true, downloadError });
+      runDomReady(context);
+      const anchor = makeAnchor("https://example.com/report.pdf", "_self");
+      anchor.download = "report.pdf";
+      getClickGuard(context)(makeClickEvent(anchor));
+      await vi.waitFor(() =>
+        expect(context.nativeDownloadClicks).toEqual([
+          [anchor.href, "report.pdf"],
+        ]),
+      );
+      expect(
+        context.invokeCalls.filter(([command]) => command === "download_file"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("does not retry failed HTTP downloads through the browser", async () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      downloadError: "Download failed with HTTP status 403 Forbidden",
+    });
+    runDomReady(context);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      getClickGuard(context)(
+        makeClickEvent(makeAnchor("https://example.com/report.pdf", "_self")),
+      );
+      await vi.waitFor(() => expect(log).toHaveBeenCalled());
+      expect(context.nativeDownloadClicks).toEqual([]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([undefined, "", "  ", "about:blank", "about:blank#download"])(
+    "preserves a native blank popup proxy for %s",
+    (url) => {
+      const context = loadEventHelpers({ withTauri: true });
+      const popup = { location: { href: "about:blank" } };
+      const nativeOpen = vi.fn(() => popup);
+      context.window.open = nativeOpen;
+      runDomReady(context);
+      const result = context.window.open(url, "_blank");
+      expect(result).toBe(popup);
+      expect(nativeOpen).toHaveBeenCalledWith(
+        url === undefined || !url.trim() ? "about:blank" : url,
+        "_blank",
+        undefined,
+      );
+      result.location.href = "https://cdn.example.net/attachment";
+      expect(context.window.location.href).toBe("https://example.com/app");
+      expect(
+        context.invokeCalls.filter(([cmd]) => cmd === "plugin:shell|open"),
+      ).toEqual([]);
+    },
+  );
+
+  const GOOGLE_POPUP =
+    "https://accounts.google.com/o/oauth2/v2/auth?gsiwebsdk=gis_attributes&client_id=1";
+  const GOOGLE_SPECS =
+    "toolbar=no,location=no,menubar=no,resizable=no,width=590,height=830,top=143.5,left=569";
+  const loadPopupPage = (userAgent, config = {}) => {
+    const context = loadEventHelpers({ withTauri: true, userAgent });
+    context.window.pakeConfig = config;
+    context.window.isAuthPopup = (url) => url.includes("accounts.google.com");
+    const popup = { location: { href: "about:blank" }, close: vi.fn() };
+    const nativeOpen = vi.fn(() => popup);
+    context.window.open = nativeOpen;
+    runDomReady(context);
+    return { context, popup, nativeOpen };
+  };
+  const MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)";
+
+  const WINDOWS = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+  const LINUX = "Mozilla/5.0 (X11; Linux x86_64)";
+
+  it.each([
+    ["macOS", MAC],
+    ["Windows", WINDOWS],
+  ])(
+    "gives a sized sign-in popup its own window and opener on %s",
+    (_platform, userAgent) => {
+      // TikTok's Google button: the page waits for this popup to answer it.
+      const { context, popup, nativeOpen } = loadPopupPage(userAgent);
+      const result = context.window.open(
+        GOOGLE_POPUP,
+        "g_auth_token_window",
+        GOOGLE_SPECS,
+      );
+      expect(result).toBe(popup);
+      // Straight to its address: a popup opened blank and sent there
+      // afterwards loses its opener on a site with an opener policy.
+      expect(nativeOpen.mock.calls).toEqual([
+        [GOOGLE_POPUP, "g_auth_token_window", GOOGLE_SPECS],
+      ]);
+      expect(context.window.location.href).toBe("https://example.com/app");
+    },
+  );
+
+  it("keeps Linux on its previous sign-in route until popups are checked there", () => {
+    const { context, nativeOpen } = loadPopupPage(LINUX);
+    expect(
+      context.window.open(GOOGLE_POPUP, "g_auth_token_window", GOOGLE_SPECS),
+    ).toBe(context.window);
+    expect(nativeOpen).not.toHaveBeenCalled();
+    expect(context.window.location.href).toBe(GOOGLE_POPUP);
+  });
+
+  it("judges the app's own site by its configured address in a Windows subframe", () => {
+    // WebView2 runs event.js in frames; a widget's own address is not the app.
+    const load = () => {
+      const context = loadEventHelpers({
+        withTauri: true,
+        userAgent: WINDOWS,
+        topWindow: { postMessage: () => {} },
+      });
+      context.window.pakeConfig = { url: "https://app.example.net/" };
+      const popup = { location: { href: "about:blank" }, close: vi.fn() };
+      const nativeOpen = vi.fn(() => popup);
+      context.window.open = nativeOpen;
+      runDomReady(context);
+      return { context, popup, nativeOpen };
+    };
+
+    const widget = load();
+    widget.context.window.open(
+      "https://example.com/share",
+      "share",
+      "width=600,height=400",
+    );
+    expect(widget.nativeOpen).not.toHaveBeenCalled();
+
+    const app = load();
+    expect(
+      app.context.window.open(
+        "https://app.example.net/popup",
+        "flow",
+        "width=600,height=400",
+      ),
+    ).toBe(app.popup);
+    expect(app.nativeOpen.mock.calls).toEqual([
+      ["https://app.example.net/popup", "flow", "width=600,height=400"],
+    ]);
+  });
+
+  it("gives a sized popup of the app's own site its own window", () => {
+    // Notion's Google button opens a page of its own that redirects to Google.
+    const { context, popup, nativeOpen } = loadPopupPage(MAC);
+    const specs = "toolbar=0,menubar=0,location=0,width=610,height=700";
+    const result = context.window.open(
+      "/verifyNoPopupBlockerHtmlAndRedirect?redirectUri=x",
+      " Google",
+      specs,
+    );
+    expect(result).toBe(popup);
+    expect(nativeOpen.mock.calls).toEqual([
+      [
+        "https://example.com/verifyNoPopupBlockerHtmlAndRedirect?redirectUri=x",
+        " Google",
+        specs,
+      ],
+    ]);
+    expect(context.window.location.href).toBe("https://example.com/app");
+  });
+
+  it("leaves a sized own-site popup on the native route with new_window", () => {
+    const { context, popup, nativeOpen } = loadPopupPage(MAC, {
+      new_window: true,
+    });
+    expect(context.window.open("/compose", "compose", "width=600")).toBe(popup);
+    expect(nativeOpen.mock.calls).toEqual([
+      ["https://example.com/compose", "compose", "width=600"],
+    ]);
+  });
+
+  it.each([
+    ["no features", "oauth", undefined],
+    ["noopener", "oauth", "noopener,width=590,height=830"],
+    ["noopener after a space", "oauth", "width=590 height=830 noopener"],
+    ["a _self target", "_self", "width=590,height=830"],
+    ["a zero size", "oauth", "width=0,height=0"],
+    ["popup=no beside a size", "oauth", "popup=no,width=590,height=830"],
+  ])(
+    "keeps a macOS sign-in with %s in the current window",
+    (_case, name, specs) => {
+      const { context, nativeOpen } = loadPopupPage(MAC);
+      expect(context.window.open(GOOGLE_POPUP, name, specs)).toBe(
+        context.window,
+      );
+      expect(nativeOpen).not.toHaveBeenCalled();
+      expect(context.window.location.href).toBe(GOOGLE_POPUP);
+    },
+  );
+
+  it("falls back to the current window when the popup is refused", () => {
+    const { context, nativeOpen } = loadPopupPage(MAC);
+    nativeOpen.mockReturnValue(null);
+    expect(context.window.open(GOOGLE_POPUP, "oauth", GOOGLE_SPECS)).toBe(
+      context.window,
+    );
+    expect(nativeOpen.mock.calls).toEqual([
+      [GOOGLE_POPUP, "oauth", GOOGLE_SPECS],
+    ]);
+    expect(context.window.location.href).toBe(GOOGLE_POPUP);
+  });
+
+  it.each([
+    ["a popup", {}],
+    ["the main window", null],
+  ])(
+    "waits out the page load's IPC before %s closes itself on macOS",
+    (_case, opener) => {
+      vi.useFakeTimers();
+      try {
+        const nativeClose = vi.fn();
+        const { window } = loadEventHelpers({
+          userAgent: MAC,
+          opener,
+          nativeClose,
+        });
+        // A callback page answers its opener and closes in its first script.
+        window.close();
+        window.close();
+        expect(nativeClose).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(149);
+        expect(nativeClose).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(1);
+        expect(nativeClose).toHaveBeenCalledOnce();
+        // A close the engine refused does not swallow the next one.
+        window.close();
+        vi.advanceTimersByTime(150);
+        expect(nativeClose).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each([
+    ["Windows", WINDOWS],
+    ["Linux", LINUX],
+  ])("leaves window.close alone on %s", (_platform, userAgent) => {
+    const nativeClose = vi.fn();
+    const { window } = loadEventHelpers({ userAgent, opener: {}, nativeClose });
+    window.close();
+    expect(nativeClose).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a frame's window.close alone on macOS", () => {
+    const nativeClose = vi.fn();
+    const { window } = loadEventHelpers({
+      userAgent: MAC,
+      nativeClose,
+      topWindow: { postMessage: () => {} },
+    });
+    window.close();
+    expect(nativeClose).toHaveBeenCalledOnce();
+  });
+
+  it("still sends a sized popup of another site to the system browser", () => {
+    const { context, nativeOpen } = loadPopupPage(MAC);
+    expect(
+      context.window.open(
+        "https://outside.example/share",
+        "share",
+        "width=600,height=400",
+      ),
+    ).toBeNull();
+    expect(nativeOpen).not.toHaveBeenCalled();
+    expect(context.invokeCalls).toContainEqual([
+      "plugin:shell|open",
+      { path: "https://outside.example/share" },
+    ]);
+    expect(context.window.location.href).toBe("https://example.com/app");
+  });
+
+  it.each(["https://outside.example/report", "https://example.com/report"])(
+    "retains the default route for a new named context: %s",
+    (url) => {
+      const context = loadEventHelpers({ withTauri: true });
+      context.window.open = vi.fn(() => null);
+      runDomReady(context);
+      context.window.open(url, "reportWindow");
+      if (url.startsWith("https://outside.example/")) {
+        expect(context.invokeCalls).toContainEqual([
+          "plugin:shell|open",
+          { path: url },
+        ]);
+      } else {
+        expect(context.window.location.href).toBe(url);
+      }
+    },
+  );
+
+  it.each([
+    ["internal", "https://example.com/forced", {}],
+    ["auth", "https://accounts.google.com/o/oauth2/auth", {}],
+    [
+      "forced internal",
+      "https://outside.example/forced",
+      { force_internal_navigation: true },
+    ],
+    [
+      "regex internal",
+      "https://outside.example/forced",
+      { internal_url_regex: "outside\\.example" },
+    ],
+  ])(
+    "rejects forged %s frame messages without navigating or opening windows",
+    (_kind, url, config) => {
+      const context = loadEventHelpers({
+        withTauri: true,
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
+      });
+      context.window.pakeConfig = config;
+      context.window.isAuthLink = context.window.isAuthPopup = (value) =>
+        value.includes("accounts.google.com");
+      const nativeOpen = vi.fn(() => ({}));
+      context.window.open = nativeOpen;
+      runDomReady(context);
+      const frame = { frames: [] };
+      context.window.frames.push(frame);
+      context.eventListeners.message[0].handler({
+        source: frame,
+        data: { type: "pake:frame-external-link", url },
+      });
+      expect(context.window.location.href).toBe("https://example.com/app");
+      expect(nativeOpen).not.toHaveBeenCalled();
+      expect(
+        context.invokeCalls.filter(
+          ([command]) => command === "plugin:shell|open",
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it("routes early frame messages once after readiness and rechecks live sources", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    const live = { frames: [] };
+    const removed = { frames: [] };
+    context.window.frames.push(live, removed);
+    const listener = context.eventListeners.message?.[0]?.handler;
+    expect(listener).toBeTypeOf("function");
+    for (const [source, suffix] of [
+      [live, "first"],
+      [live, "second"],
+      [removed, "removed"],
+    ]) {
+      listener({
+        source,
+        data: {
+          type: "pake:frame-external-link",
+          url: `https://outside.example/${suffix}`,
+        },
+      });
+    }
+    expect(context.invokeCalls).toEqual([]);
+    context.window.frames.pop();
+    runDomReady(context);
+    expect(
+      context.invokeCalls.filter(
+        ([command]) => command === "plugin:shell|open",
+      ),
+    ).toEqual([
+      ["plugin:shell|open", { path: "https://outside.example/first" }],
+      ["plugin:shell|open", { path: "https://outside.example/second" }],
+    ]);
+    expect(context.eventListeners.DOMContentLoaded).toHaveLength(1);
+  });
+
+  it("discards a departing document's queued frame messages", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    const frame = { frames: [] };
+    context.window.frames.push(frame);
+    const listener = context.eventListeners.message?.[0]?.handler;
+    expect(listener).toBeTypeOf("function");
+    listener({
+      source: frame,
+      data: {
+        type: "pake:frame-external-link",
+        url: "https://outside.example/old",
+      },
+    });
+    context.eventListeners.pagehide[0].handler();
+    runDomReady(context);
+    expect(
+      context.invokeCalls.filter(
+        ([command]) => command === "plugin:shell|open",
+      ),
+    ).toEqual([]);
+  });
+
+  it("routes only descendant-frame messages with supported URL protocols", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+    const frame = { frames: [] };
+    context.window.frames.push(frame);
+    const listener = context.eventListeners.message[0].handler;
+    const send = (source, url) =>
+      listener({ source, data: { type: "pake:frame-external-link", url } });
+    send(frame, "https://outside.example/article");
+    expect(context.invokeCalls).toContainEqual([
+      "plugin:shell|open",
+      { path: "https://outside.example/article" },
+    ]);
+    const count = context.invokeCalls.length;
+    send({ frames: [] }, "https://outside.example/unrelated");
+    send(frame, "file:///tmp/example");
+    send(frame, "javascript:alert(1)");
+    send(null, "https://outside.example/opaque");
+    expect(context.invokeCalls).toHaveLength(count);
+  });
+  it("falls back from malformed saved zoom values", () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      initialZoom: "not-a-zoom",
+    });
+
+    context.zoomIn();
+    context.zoomOut();
+
+    expect(context.invokeCalls).toEqual([
+      ["set_zoom", { percent: 110 }],
+      ["set_zoom", { percent: 100 }],
+    ]);
+    expect(context.localStorageValues.get("htmlZoom")).toBe("100%");
+  });
+
+  it("bypasses javascript pseudo-links", () => {
+    const { shouldBypassPakeLinkHandling } = loadEventHelpers();
+
+    expect(shouldBypassPakeLinkHandling("javascript:void(0)")).toBe(true);
+  });
+
+  it("bypasses hash-only anchors", () => {
+    const { shouldBypassPakeLinkHandling } = loadEventHelpers();
+
+    expect(shouldBypassPakeLinkHandling("#captcha-confirm")).toBe(true);
+  });
+
+  it("keeps normal navigations under Pake handling", () => {
+    const { shouldBypassPakeLinkHandling } = loadEventHelpers();
+
+    expect(shouldBypassPakeLinkHandling("https://example.com/account")).toBe(
+      false,
+    );
+  });
+
+  it("navigates GitHub release pages instead of downloading them as documents", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.location.href = "https://github.com/owner/repo/releases";
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor("https://github.com/owner/repo/releases/tag/v1.28.3", "_self"),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(event.stopImmediatePropagation).not.toHaveBeenCalled();
+    expect(context.invokeCalls).not.toContainEqual([
+      "download_file",
+      expect.anything(),
+    ]);
+  });
+
+  it("still downloads files linked from GitHub releases", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.location.href = "https://github.com/owner/repo/releases";
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor(
+        "https://github.com/owner/repo/releases/download/v1.28.3/app.dmg",
+        "_self",
+      ),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(event.stopImmediatePropagation).toHaveBeenCalled();
+    expect(context.invokeCalls).toContainEqual([
+      "download_file",
+      {
+        params: {
+          url: "https://github.com/owner/repo/releases/download/v1.28.3/app.dmg",
+          filename: "app.dmg",
+          language: "en-US",
+          page_url: "https://github.com/owner/repo/releases",
+          user_agent: "Mozilla/5.0",
+        },
+      },
+    ]);
+  });
+
+  it("navigates SPA routes under /assets/ instead of treating them as downloads", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.location.href = "https://www.mexc.com/";
+    context.window.location.origin = "https://www.mexc.com";
+    context.window.location.pathname = "/";
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor("https://www.mexc.com/assets/future", "_self"),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(context.invokeCalls).not.toContainEqual([
+      "download_file",
+      expect.anything(),
+    ]);
+    expect(
+      context.isDownloadableFile("https://www.mexc.com/assets/future"),
+    ).toBe(false);
+  });
+
+  it("still downloads real files that live under /assets/ by extension", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(
+      isDownloadableFile("https://cdn.example.com/assets/export/report.pdf"),
+    ).toBe(true);
+    expect(
+      isDownloadableFile("https://cdn.example.com/assets/pkg/app.zip"),
+    ).toBe(true);
+  });
+
+  it("keeps intentional download-path interception for extensionless /download/ links", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(isDownloadableFile("https://example.com/download/export")).toBe(
+      true,
+    );
+    // Real files under /files/ still match by extension, not the path root.
+    expect(isDownloadableFile("https://example.com/files/report.pdf")).toBe(
+      true,
+    );
+  });
+
+  it("does not treat /files/ SPA routes without a file extension as downloads", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(isDownloadableFile("https://drive.example.com/files/inbox")).toBe(
+      false,
+    );
+    expect(
+      isDownloadableFile("https://app.example.com/attachments/latest"),
+    ).toBe(false);
+  });
+
+  it("does not treat static /dist/ SPA paths as downloads without a file extension", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(isDownloadableFile("https://example.com/dist/app")).toBe(false);
+  });
+
+  it("opens a Cmd/Ctrl-clicked link in the default browser, not as a download", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor("https://example.com/app/settings", "_self"),
+    );
+    event.metaKey = true;
+    event.ctrlKey = true;
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(context.invokeCalls).toEqual([
+      ["plugin:shell|open", { path: "https://example.com/app/settings" }],
+    ]);
+  });
+
+  // A user's request (2026-11-22): Cmd-click on macOS and Ctrl-click on
+  // Windows and Linux open any link, the app's own site included, in the
+  // default browser, as a browser opens it in a new tab; a middle click too.
+  it.each([
+    ["macOS", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "metaKey"],
+    ["Windows", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "ctrlKey"],
+    ["Linux", "Mozilla/5.0 (X11; Linux x86_64)", "ctrlKey"],
+  ])(
+    "opens a modifier-clicked link in the browser on %s",
+    (_, userAgent, key) => {
+      for (const href of [
+        "https://example.com/app/next",
+        "https://other.example/page",
+      ]) {
+        const context = loadEventHelpers({ withTauri: true, userAgent });
+        runDomReady(context);
+        const event = makeClickEvent(makeAnchor(href, "_self"));
+        event[key] = true;
+        getClickGuard(context)(event);
+        expect(event.preventDefault).toHaveBeenCalledOnce();
+        expect(context.invokeCalls).toEqual([
+          ["plugin:shell|open", { path: href }],
+        ]);
+      }
+    },
+  );
+
+  it("leaves Ctrl-click alone on macOS, where it is a secondary click", () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    });
+    runDomReady(context);
+    const event = makeClickEvent(
+      makeAnchor("https://example.com/app/next", "_self"),
+    );
+    event.ctrlKey = true;
+    getClickGuard(context)(event);
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(context.invokeCalls).toEqual([]);
+  });
+
+  it("opens a middle-clicked link in the browser", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+    const middle = context.eventListeners.auxclick.find(
+      ({ handler }) => handler.name === "openMiddleClickedLink",
+    ).handler;
+    const event = makeClickEvent(
+      makeAnchor("https://example.com/app/next", "_self"),
+    );
+    event.button = 1;
+    middle(event);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(context.invokeCalls).toEqual([
+      ["plugin:shell|open", { path: "https://example.com/app/next" }],
+    ]);
+
+    const right = makeClickEvent(
+      makeAnchor("https://example.com/app/next", "_self"),
+    );
+    right.button = 2;
+    middle(right);
+    expect(right.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("keeps downloading a Cmd-clicked download link", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+    const anchor = makeAnchor("https://example.com/report.pdf", "_self");
+    anchor.download = "report.pdf";
+    const event = makeClickEvent(anchor);
+    event.metaKey = true;
+    getClickGuard(context)(event);
+    expect(context.invokeCalls).not.toContainEqual([
+      "plugin:shell|open",
+      expect.anything(),
+    ]);
+  });
+
+  it("still downloads when the anchor has a download attribute", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+
+    const anchor = makeAnchor("https://example.com/app/settings", "_self");
+    anchor.download = "settings.html";
+    const event = makeClickEvent(anchor);
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(context.invokeCalls).toContainEqual([
+      "download_file",
+      {
+        params: {
+          url: "https://example.com/app/settings",
+          filename: "settings.html",
+          language: "en-US",
+          page_url: "https://example.com/app",
+          user_agent: "Mozilla/5.0",
+        },
+      },
+    ]);
+  });
+
+  it("does not treat navigable web formats as downloads by extension alone", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(isDownloadableFile("https://example.com/api/config.json")).toBe(
+      false,
+    );
+    expect(isDownloadableFile("https://example.com/docs/app.js")).toBe(false);
+    expect(isDownloadableFile("https://example.com/theme.css")).toBe(false);
+    // Binary / archive extensions still download.
+    expect(isDownloadableFile("https://example.com/report.pdf")).toBe(true);
+    expect(isDownloadableFile("https://example.com/pkg.zip")).toBe(true);
+  });
+
+  it("scopes root domains correctly for multi-part public suffixes", () => {
+    const { getRootDomain } = loadEventHelpers();
+
+    expect(getRootDomain("www.amazon.co.uk")).toBe("amazon.co.uk");
+    expect(getRootDomain("evil.co.uk")).toBe("evil.co.uk");
+    expect(getRootDomain("www.amazon.co.uk")).not.toBe(
+      getRootDomain("evil.co.uk"),
+    );
+    expect(getRootDomain("alice.github.io")).toBe("alice.github.io");
+    expect(getRootDomain("bob.github.io")).toBe("bob.github.io");
+    expect(getRootDomain("m.bilibili.com")).toBe("bilibili.com");
+    expect(getRootDomain("www.bilibili.com")).toBe("bilibili.com");
+  });
+
+  it("navigates macOS auth URLs in the current window", () => {
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
+    });
+    const openCalls = [];
+    const originalWindowOpen = (url, name, specs) => {
+      openCalls.push({ url, name, specs });
+      return {};
+    };
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "https://www.linkedin.com/login",
+      "_blank",
+      "width=1200,height=800",
+    );
+
+    expect(openCalls).toEqual([]);
+    expect(window.location.href).toBe("https://www.linkedin.com/login");
+    expect(result).toBe(window);
+  });
+
+  it("navigates Linux auth URLs in the current window", () => {
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64)",
+    });
+    const originalWindowOpen = vi.fn(() => ({}));
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "https://accounts.google.com/o/oauth2/auth",
+      "_blank",
+      "width=1200,height=800",
+    );
+
+    expect(originalWindowOpen).not.toHaveBeenCalled();
+    expect(window.location.href).toBe(
+      "https://accounts.google.com/o/oauth2/auth",
+    );
+    expect(result).toBe(window);
+  });
+
+  it("keeps Windows auth URLs on the native popup path", () => {
+    const popup = {};
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    });
+    const originalWindowOpen = vi.fn(() => popup);
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "https://accounts.google.com/o/oauth2/auth",
+      "_blank",
+      "width=1200,height=800",
+    );
+
+    expect(originalWindowOpen).toHaveBeenCalledWith(
+      "https://accounts.google.com/o/oauth2/auth",
+      "_blank",
+      "width=1200,height=800",
+    );
+    expect(window.location.href).toBe("https://example.com/app");
+    expect(result).toBe(popup);
+  });
+
+  it("keeps blank macOS auth popups on the native popup path", () => {
+    const popup = {};
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
+    });
+    const openCalls = [];
+    const originalWindowOpen = (url, name, specs) => {
+      openCalls.push({ url, name, specs });
+      return popup;
+    };
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "about:blank",
+      "login",
+      "width=1200,height=800",
+    );
+
+    expect(openCalls).toEqual([
+      {
+        url: "about:blank",
+        name: "login",
+        specs: "width=1200,height=800",
+      },
+    ]);
+    expect(window.location.href).toBe("https://example.com/app");
+    expect(result).toBe(popup);
+  });
+
+  it("keeps named Apple auth popups on the native popup path on macOS", () => {
+    const popup = {};
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
+    });
+    const openCalls = [];
+    const originalWindowOpen = (url, name, specs) => {
+      openCalls.push({ url, name, specs });
+      return popup;
+    };
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "https://example.com/apple/login",
+      "AppleAuthentication",
+      "width=1200,height=800",
+    );
+
+    expect(openCalls).toEqual([
+      {
+        url: "https://example.com/apple/login",
+        name: "AppleAuthentication",
+        specs: "width=1200,height=800",
+      },
+    ]);
+    expect(window.location.href).toBe("https://example.com/app");
+    expect(result).toBe(popup);
+  });
+
+  it("keeps appleid auth URL popups on the native popup path on macOS", () => {
+    const popup = {};
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
+    });
+    const openCalls = [];
+    const originalWindowOpen = (url, name, specs) => {
+      openCalls.push({ url, name, specs });
+      return popup;
+    };
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "https://appleid.apple.com/auth/authorize",
+      "_blank",
+      "width=1200,height=800",
+    );
+
+    expect(openCalls).toEqual([
+      {
+        url: "https://appleid.apple.com/auth/authorize",
+        name: "_blank",
+        specs: "width=1200,height=800",
+      },
+    ]);
+    expect(window.location.href).toBe("https://example.com/app");
+    expect(result).toBe(popup);
+  });
+
+  it("falls back to current-window navigation if an Apple auth popup is blocked", () => {
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
+    });
+    const originalWindowOpen = vi.fn(() => null);
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "https://appleid.apple.com/auth/authorize",
+      "_blank",
+      "width=1200,height=800",
+    );
+
+    expect(originalWindowOpen).toHaveBeenCalledWith(
+      "https://appleid.apple.com/auth/authorize",
+      "_blank",
+      "width=1200,height=800",
+    );
+    expect(window.location.href).toBe(
+      "https://appleid.apple.com/auth/authorize",
+    );
+    expect(result).toBe(window);
+  });
+
+  it("navigates target blank auth links in-place when new-window is disabled", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = { new_window: false };
+    context.window.isAuthLink = (url) => url.includes("okta.com");
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor("https://mycompany.okta.com/sso", "_blank"),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(event.stopImmediatePropagation).toHaveBeenCalled();
+    expect(context.window.location.href).toBe("https://mycompany.okta.com/sso");
+  });
+
+  it("retargets internal target=_blank links to _self instead of forcing a reload", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = {
+      new_window: false,
+      internal_url_regex: "^https://app\\.example\\.com",
+    };
+    runDomReady(context);
+
+    const anchor = makeAnchor("https://app.example.com/callback", "_blank");
+    const event = makeClickEvent(anchor);
+    getClickGuard(context)(event);
+
+    // The link must be neutralized so the native webview never opens a system
+    // browser window, but the page's own click handler (and a normal in-app
+    // navigation) should still run -- so we do NOT preventDefault / reload.
+    expect(anchor.target).toBe("_self");
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(event.stopImmediatePropagation).not.toHaveBeenCalled();
+    expect(context.window.location.href).toBe("https://example.com/app");
+  });
+
+  const loadNewWindowPage = () => {
+    vi.useFakeTimers();
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = { new_window: true };
+    const nativeOpen = vi.fn(() => ({}));
+    context.window.open = nativeOpen;
+    runDomReady(context);
+    const lastInBubble = context.eventListeners.click.find(
+      ({ handler }) => handler.name === "openUnhandledBlankLink",
+    ).handler;
+    return { context, nativeOpen, lastInBubble };
+  };
+
+  it("leaves a new-window link the page handled itself alone", () => {
+    // Douyin's episode list: target="_blank", href "undefined", and a click
+    // handler that switches the video. Left as _blank it reached the shell
+    // plugin's own listener, which opened it in the system browser.
+    try {
+      const { context, nativeOpen, lastInBubble } = loadNewWindowPage();
+      const anchor = makeAnchor("https://example.com/undefined", "_blank");
+      const event = { ...makeClickEvent(anchor), defaultPrevented: false };
+      getClickGuard(context)(event);
+      expect(anchor.target).toBe("_self");
+      event.defaultPrevented = true; // the page's handler ran
+      lastInBubble(event);
+      expect(nativeOpen).not.toHaveBeenCalled();
+      expect(event.preventDefault).not.toHaveBeenCalled();
+      expect(
+        context.invokeCalls.filter(([cmd]) => cmd === "plugin:shell|open"),
+      ).toEqual([]);
+      vi.runAllTimers();
+      expect(anchor.target).toBe("_blank");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an internal _new link in the app instead of the system browser", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = { new_window: false };
+    runDomReady(context);
+    const anchor = makeAnchor("https://example.com/video/1", "_new");
+    const event = makeClickEvent(anchor);
+    getClickGuard(context)(event);
+    expect(anchor.target).toBe("_self");
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(
+      context.invokeCalls.filter(([cmd]) => cmd === "plugin:shell|open"),
+    ).toEqual([]);
+  });
+
+  const loadPageWithBubble = (newWindow) => {
+    vi.useFakeTimers();
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = { new_window: newWindow };
+    const nativeOpen = vi.fn(() => ({}));
+    context.window.open = nativeOpen;
+    runDomReady(context);
+    const lastInBubble = context.eventListeners.click.find(
+      ({ handler }) => handler.name === "openUnhandledBlankLink",
+    ).handler;
+    return { context, nativeOpen, lastInBubble };
+  };
+  const shellOpens = (context) =>
+    context.invokeCalls.filter(([cmd]) => cmd === "plugin:shell|open");
+
+  for (const newWindow of [false, true]) {
+    it(`takes the new-tab target off a link with no address for the click (new_window ${newWindow})`, () => {
+      // Douyin's episode covers: <a target="_blank"> with no href. Their own
+      // handler sets href to "undefined" during the click, switches the video
+      // and prevents the default. Left as _blank the link reached the shell
+      // plugin's listener, which opened douyin.com/undefined in the browser.
+      try {
+        const { context, nativeOpen, lastInBubble } =
+          loadPageWithBubble(newWindow);
+        const anchor = makeAnchor("", "_blank");
+        const event = { ...makeClickEvent(anchor), defaultPrevented: false };
+        getClickGuard(context)(event);
+        // What the shell plugin's listener would read in the bubble.
+        expect(anchor.target).toBe("_self");
+        expect(event.preventDefault).not.toHaveBeenCalled();
+        // The page's handler: an address appears and the click is handled.
+        anchor.href = "https://example.com/undefined";
+        event.defaultPrevented = true;
+        lastInBubble(event);
+        expect(event.preventDefault).not.toHaveBeenCalled();
+        expect(nativeOpen).not.toHaveBeenCalled();
+        expect(shellOpens(context)).toEqual([]);
+        vi.runAllTimers();
+        expect(anchor.target).toBe("_blank");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it("routes a link that got an external address during the click, once", () => {
+    try {
+      const { context, nativeOpen, lastInBubble } = loadPageWithBubble(false);
+      const anchor = makeAnchor("", "_blank");
+      const event = { ...makeClickEvent(anchor), defaultPrevented: false };
+      getClickGuard(context)(event);
+      anchor.href = "https://other.example.org/page";
+      lastInBubble(event);
+      expect(event.preventDefault).toHaveBeenCalledOnce();
+      expect(shellOpens(context)).toHaveLength(1);
+      expect(nativeOpen).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a link that got an internal address during the click in the app", () => {
+    try {
+      // Without --new-window the default action follows the _self target.
+      const off = loadPageWithBubble(false);
+      const stay = makeAnchor("", "_blank");
+      const first = { ...makeClickEvent(stay), defaultPrevented: false };
+      getClickGuard(off.context)(first);
+      stay.href = "https://example.com/video/2";
+      off.lastInBubble(first);
+      expect(first.preventDefault).not.toHaveBeenCalled();
+      expect(shellOpens(off.context)).toEqual([]);
+      expect(off.nativeOpen).not.toHaveBeenCalled();
+      vi.useRealTimers();
+
+      // With it the link opens in an app window.
+      const on = loadPageWithBubble(true);
+      const open = makeAnchor("", "_blank");
+      const second = { ...makeClickEvent(open), defaultPrevented: false };
+      getClickGuard(on.context)(second);
+      open.href = "https://example.com/video/2";
+      on.lastInBubble(second);
+      expect(second.preventDefault).toHaveBeenCalledOnce();
+      expect(on.nativeOpen.mock.calls).toEqual([
+        ["https://example.com/video/2", "_blank"],
+      ]);
+      expect(shellOpens(on.context)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens a new-window link nobody handled in an in-app window", () => {
+    try {
+      const { context, nativeOpen, lastInBubble } = loadNewWindowPage();
+      const anchor = makeAnchor("https://example.com/video/1", "_blank");
+      const event = { ...makeClickEvent(anchor), defaultPrevented: false };
+      getClickGuard(context)(event);
+      lastInBubble(event);
+      expect(event.preventDefault).toHaveBeenCalledOnce();
+      expect(nativeOpen.mock.calls).toEqual([
+        ["https://example.com/video/1", "_blank"],
+      ]);
+      // A later, unrelated click finds nothing pending.
+      lastInBubble({ defaultPrevented: false, preventDefault: vi.fn() });
+      expect(nativeOpen).toHaveBeenCalledOnce();
+      vi.runAllTimers();
+      expect(anchor.target).toBe("_blank");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still opens external target=_blank links in the system browser", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = { new_window: false };
+    runDomReady(context);
+
+    const anchor = makeAnchor("https://other.example.org/page", "_blank");
+    const event = makeClickEvent(anchor);
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(event.stopImmediatePropagation).toHaveBeenCalled();
+    expect(context.invokeCalls).toContainEqual([
+      "plugin:shell|open",
+      { path: "https://other.example.org/page" },
+    ]);
+  });
+
+  it("hands external links from a subframe to the top page instead of IPC", () => {
+    // WebView2 injects event.js into subframes, whose origin has no IPC grant.
+    const messages = [];
+    const context = loadEventHelpers({
+      withTauri: true,
+      topWindow: { postMessage: (message) => messages.push(message) },
+    });
+    runDomReady(context);
+
+    expect(context.window.open("https://outside.example/launch")).toBeNull();
+    const event = makeClickEvent(
+      makeAnchor("https://outside.example/page", "_new"),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "pake:frame-external-link",
+        url: "https://outside.example/launch",
+      },
+      { type: "pake:frame-external-link", url: "https://outside.example/page" },
+    ]);
+    expect(
+      context.invokeCalls.filter(
+        ([command]) => command === "plugin:shell|open",
+      ),
+    ).toEqual([]);
+  });
+
+  it("bridges Web Badging API calls to explicit badge commands", async () => {
+    const { navigator, invokeCalls } = loadEventHelpers({ withTauri: true });
+
+    await navigator.setAppBadge(3.8);
+    await navigator.setAppBadge();
+    await navigator.setAppBadge(0);
+
+    expect(invokeCalls).toEqual([
+      ["set_dock_badge", { count: 3 }],
+      ["set_dock_badge_label", { label: "•" }],
+      ["clear_dock_badge", undefined],
+    ]);
+  });
+
+  it("keeps notification display separate from badge increment", async () => {
+    const { window, invokeCalls } = loadEventHelpers({ withTauri: true });
+
+    new window.Notification("Hello", { body: "World", icon: "/icon.png" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(invokeCalls).toEqual([
+      [
+        "send_notification",
+        {
+          params: {
+            // Correlates the native click callback back to this instance.
+            id: expect.stringMatching(/^[A-Za-z0-9_-]{1,64}$/),
+            title: "Hello",
+            body: "World",
+            icon: "https://example.com/icon.png",
+            silent: false,
+          },
+        },
+      ],
+      ["increment_dock_badge", undefined],
+    ]);
+  });
+});
+
+describe("getFilenameFromUrl data URI extension", () => {
+  it("maps a structured image subtype to a real extension (svg+xml -> svg)", () => {
+    const context = loadEventHelpers();
+    const filename = context.getFilenameFromUrl(
+      "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+    );
+    expect(filename).toMatch(/^image-.*\.svg$/);
+    expect(filename).not.toContain("+");
+  });
+
+  it("normalizes jpeg to jpg", () => {
+    const context = loadEventHelpers();
+    expect(context.getFilenameFromUrl("data:image/jpeg;base64,AAAA")).toMatch(
+      /^image-.*\.jpg$/,
+    );
+  });
+
+  it("does not fold the data payload into the extension when ';' is absent", () => {
+    const context = loadEventHelpers();
+    const filename = context.getFilenameFromUrl("data:image/png,rawdata");
+    expect(filename).toMatch(/^image-.*\.png$/);
+    expect(filename).not.toContain("data:image/");
+  });
+});
+
+describe("getFilenameFromUrl percent-encoded path", () => {
+  it("decodes the file name the way browsers name downloads", () => {
+    const context = loadEventHelpers();
+    expect(
+      context.getFilenameFromUrl(
+        "https://example.com/files/Annual%20Report%202026.pdf",
+      ),
+    ).toBe("Annual Report 2026.pdf");
+    expect(
+      context.getFilenameFromUrl("https://example.com/%E6%8A%A5%E5%91%8A.pdf"),
+    ).toBe("报告.pdf");
+  });
+
+  it.each(["a%2F..%2Fsecret.pdf", "bad%E0%A4.pdf", "%E2%80%AEfdp.pdf"])(
+    "keeps the encoded name when decoding is unsafe or malformed: %s",
+    (name) => {
+      const context = loadEventHelpers();
+      expect(
+        context.getFilenameFromUrl(`https://example.com/files/${name}`),
+      ).toBe(name);
+    },
+  );
+
+  it("passes the decoded name to download_file", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+    const anchor = makeAnchor(
+      "https://example.com/files/Annual%20Report.pdf",
+      "_self",
+    );
+    getClickGuard(context)(makeClickEvent(anchor));
+    expect(
+      context.invokeCalls
+        .filter(([command]) => command === "download_file")
+        .map(([, payload]) => payload.params.filename),
+    ).toEqual(["Annual Report.pdf"]);
+  });
+
+  it("names native Windows downloads with the decoded name", () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      nativeDownloads: true,
+    });
+    runDomReady(context);
+    const anchor = makeAnchor(
+      "https://example.com/files/%E6%8A%A5%E5%91%8A%202026.pdf",
+      "_self",
+    );
+    getClickGuard(context)(makeClickEvent(anchor));
+    expect(context.nativeDownloadClicks).toEqual([
+      [anchor.href, "报告 2026.pdf"],
+    ]);
+  });
+});
+
+// Outlook opens every link in a mail with window.open and noopener. A link to
+// another site's sign-in page replaced the mail page (2026-11-23).
+describe("links in a web mail app", () => {
+  const loadOutlook = (userAgent) => {
+    const context = loadEventHelpers({ withTauri: true, userAgent });
+    runInNewContext(
+      fs.readFileSync(
+        path.join(process.cwd(), "src-tauri/src/inject/auth.js"),
+        "utf-8",
+      ),
+      context,
+    );
+    context.window.location.href = "https://outlook.live.com/mail/0/";
+    context.window.location.origin = "https://outlook.live.com";
+    context.window.location.pathname = "/mail/0/";
+    context.window.pakeConfig = { url: "https://outlook.live.com/" };
+    runDomReady(context);
+    return context;
+  };
+
+  it("opens another site's sign-in page from a mail in the browser", () => {
+    for (const ua of [
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    ]) {
+      const fresh = loadOutlook(ua);
+      const result = fresh.window.open(
+        "https://github.com/login",
+        "_blank",
+        "noopener noreferrer",
+      );
+      expect(result).toBeNull();
+      expect(fresh.window.location.href).toBe(
+        "https://outlook.live.com/mail/0/",
+      );
+      expect(
+        fresh.invokeCalls.filter(
+          ([command]) => command === "plugin:shell|open",
+        ),
+      ).toEqual([["plugin:shell|open", { path: "https://github.com/login" }]]);
+    }
+  });
+
+  it("keeps a sign-in request with an OAuth parameter in the app", () => {
+    const context = loadOutlook("Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)");
+    const url = "https://github.com/login/oauth/authorize?client_id=1";
+    context.window.open(url, "_blank", "noopener noreferrer");
+    expect(context.window.location.href).toBe(url);
+    expect(
+      context.invokeCalls.filter(
+        ([command]) => command === "plugin:shell|open",
+      ),
+    ).toEqual([]);
+  });
+});

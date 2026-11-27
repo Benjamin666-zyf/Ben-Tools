@@ -1,0 +1,1719 @@
+use crate::app::config::{PakeConfig, WindowConfig};
+#[cfg(target_os = "windows")]
+use crate::app::navigation::set_password_autosave;
+#[cfg(not(target_os = "windows"))]
+use crate::util::{
+    check_file_or_append, get_download_dir, get_download_message_with_lang,
+    sanitize_download_filename, show_toast, MessageType,
+};
+use crate::util::{data_dir_name, get_data_dir};
+#[cfg(target_os = "macos")]
+use dispatch::Queue;
+#[cfg(target_os = "macos")]
+use objc2::MainThreadMarker;
+#[cfg(target_os = "macos")]
+use objc2_web_kit::WKUserContentController;
+#[cfg(target_os = "windows")]
+use std::{os::windows::ffi::OsStrExt, ptr, sync::OnceLock};
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    sync::atomic::{AtomicU32, Ordering},
+};
+#[cfg(not(target_os = "windows"))]
+use tauri::webview::DownloadEvent;
+use tauri::{
+    webview::{NewWindowFeatures, NewWindowResponse},
+    AppHandle, Config, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::{
+    Shell::ExtractIconExW,
+    WindowsAndMessaging::{SendMessageW, ICON_BIG, ICON_SMALL, WM_SETICON},
+};
+
+use tauri::Theme;
+
+#[cfg(target_os = "macos")]
+use tauri::TitleBarStyle;
+
+/// Logical points kept free above a fitted window for its title bar.
+const TITLE_BAR_ALLOWANCE: f64 = 40.0;
+
+/// Where the main window's last title bar color is remembered on macOS.
+#[cfg(target_os = "macos")]
+pub const TITLE_BAR_COLOR_FILE: &str = "title-bar-color.txt";
+
+#[cfg(target_os = "macos")]
+fn prepare_macos_new_window_configuration(features: &NewWindowFeatures) -> tauri::Result<()> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| {
+        std::io::Error::other("macOS new-window configuration must run on the main thread")
+    })?;
+    // WebKit requires the exact target configuration it supplied to be used
+    // for the new page. Replace only the inherited content controller so Wry
+    // can register Pake's IPC handler and scripts once on the new webview.
+    let controller = unsafe { WKUserContentController::new(mtm) };
+    unsafe {
+        features
+            .opener()
+            .target_configuration
+            .setUserContentController(&controller);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn build_proxy_browser_arg(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    let scheme = url.scheme();
+    let port = url.port().or(match scheme {
+        "http" => Some(80),
+        "socks5" => Some(1080),
+        _ => None,
+    })?;
+
+    match scheme {
+        "http" | "socks5" => Some(format!("--proxy-server={scheme}://{host}:{port}")),
+        _ => None,
+    }
+}
+
+pub struct MultiWindowState {
+    pub pake_config: PakeConfig,
+    pub tauri_config: Config,
+    next_window_index: AtomicU32,
+}
+
+impl MultiWindowState {
+    pub fn new(pake_config: PakeConfig, tauri_config: Config) -> Self {
+        Self {
+            pake_config,
+            tauri_config,
+            next_window_index: AtomicU32::new(0),
+        }
+    }
+
+    fn next_window_label(&self) -> String {
+        let index = self.next_window_index.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("{SECONDARY_WINDOW_LABEL_PREFIX}{index}")
+    }
+
+    fn next_popup_label(&self) -> String {
+        let index = self.next_window_index.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("{POPUP_WINDOW_LABEL_PREFIX}{index}")
+    }
+}
+
+/// Windows a page opened take `pake-popup-N` labels: still under the
+/// `pake-*` capability glob, and apart from the Cmd+N clones' `pake-N`, so
+/// the window-state plugin can leave them out. A sign-in popup's size is the
+/// page's to choose every time, and a clone that later takes the same label
+/// must not open at the size of a sign-in popup.
+pub const POPUP_WINDOW_LABEL_PREFIX: &str = "pake-popup-";
+
+/// Secondary windows take labels under `pake-`: Cmd+N clones `pake-N`, and
+/// windows a page opened `pake-popup-N`. `capabilities/default.json` must cover them
+/// with a matching glob: an uncovered label has every IPC call denied, so
+/// external links, downloads and toasts silently stop working there.
+const SECONDARY_WINDOW_LABEL_PREFIX: &str = "pake-";
+
+#[cfg(test)]
+mod capability_tests {
+    use super::SECONDARY_WINDOW_LABEL_PREFIX;
+
+    #[test]
+    fn the_capability_covers_secondary_window_labels() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../../capabilities/default.json"))
+                .expect("capabilities/default.json should be valid JSON");
+        let webviews: Vec<&str> = capability["webviews"]
+            .as_array()
+            .expect("the capability should list its webviews")
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .collect();
+
+        assert!(webviews.contains(&"pake"));
+        assert!(webviews.contains(&format!("{SECONDARY_WINDOW_LABEL_PREFIX}*").as_str()));
+        // The one glob covers page-opened popups as well.
+        assert!(super::POPUP_WINDOW_LABEL_PREFIX.starts_with(SECONDARY_WINDOW_LABEL_PREFIX));
+    }
+}
+
+pub fn set_window(
+    app: &AppHandle,
+    config: &PakeConfig,
+    tauri_config: &Config,
+) -> tauri::Result<WebviewWindow> {
+    build_window_with_label(app, config, tauri_config, "pake")
+}
+
+pub fn open_additional_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    let state = app.state::<MultiWindowState>();
+    let label = state.next_window_label();
+    build_window_with_label(app, &state.pake_config, &state.tauri_config, &label)
+}
+
+/// The executable's own icon as (large, small) handles. A runtime template is one binary
+/// that a builder turns into many apps by patching the icon resource, so the icon compiled
+/// in as Tauri's default window icon is the template's, not the app's.
+#[cfg(target_os = "windows")]
+fn executable_icon_handles() -> Option<(isize, isize)> {
+    static EXECUTABLE_ICONS: OnceLock<Option<(isize, isize)>> = OnceLock::new();
+
+    *EXECUTABLE_ICONS.get_or_init(|| {
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("[Pake] Failed to resolve the app executable for its icon: {error}");
+                return None;
+            }
+        };
+        let executable_wide: Vec<u16> = executable
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut large_icon = ptr::null_mut();
+        let mut small_icon = ptr::null_mut();
+        let extracted = unsafe {
+            ExtractIconExW(
+                executable_wide.as_ptr(),
+                0,
+                &mut large_icon,
+                &mut small_icon,
+                1,
+            )
+        };
+        if extracted == 0 || large_icon.is_null() {
+            eprintln!(
+                "[Pake] Failed to extract the app icon from {}.",
+                executable.display()
+            );
+            return None;
+        }
+
+        // WM_SETICON keeps these handles rather than copying them. Cache the one
+        // extracted pair for the process lifetime so repeated tray restores do
+        // not leak a new HICON or leave the window with a dangling handle.
+        Some((large_icon as isize, small_icon as isize))
+    })
+}
+
+// Apps autostarted at Windows logon can register their icons before Explorer's
+// icon cache is ready (#1323). Re-assert both the small/title-bar icon and the
+// large taskbar icon whenever a window becomes visible. Both come from the
+// executable: the default window icon alone left a runtime-template app with
+// the template's icon in its title bar while the taskbar showed the app's own.
+#[cfg(target_os = "windows")]
+pub fn reapply_window_icon(window: &WebviewWindow) {
+    if let Some(icon) = window.app_handle().default_window_icon().cloned() {
+        if let Err(error) = window.set_icon(icon) {
+            eprintln!("[Pake] Failed to re-apply the window icon: {error}");
+        }
+    }
+
+    let Some((large_icon, small_icon)) = executable_icon_handles() else {
+        return;
+    };
+    match window.hwnd() {
+        Ok(hwnd) => unsafe {
+            SendMessageW(hwnd.0, WM_SETICON, ICON_BIG as usize, large_icon);
+            if small_icon != 0 {
+                SendMessageW(hwnd.0, WM_SETICON, ICON_SMALL as usize, small_icon);
+            }
+        },
+        Err(error) => {
+            eprintln!("[Pake] Failed to resolve the window handle for its icon: {error}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn reapply_window_icon(_window: &WebviewWindow) {}
+
+struct WindowBuildOptions<'a> {
+    label: &'a str,
+    url: WebviewUrl,
+    visible: bool,
+    new_window_features: Option<NewWindowFeatures>,
+}
+
+fn is_blank_popup_url(url: &Url) -> bool {
+    url.scheme() == "about" && url.path() == "blank"
+}
+
+/// The address a popup's web view is built with. WKWebView and WebView2 load
+/// a popup's address themselves into the web view they are handed, as the
+/// popup's first navigation; given the address as well, Wry loads it a second
+/// time as the app's own navigation, which moves the page to another process
+/// and drops `window.opener` (measured on macOS 26.7: a sign-in popup opened
+/// at its address reported no opener). `about:blank` is the one address
+/// Tauri does not load. Linux keeps its address: not measured there.
+fn popup_build_url(target_url: &Url) -> Url {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        Url::parse("about:blank").expect("about:blank must be a valid URL")
+    } else {
+        target_url.clone()
+    }
+}
+
+/// The app carries no Tauri global API object, since a site can see it and
+/// some treat it as an unofficial client. The user's own code may still call
+/// it, as the docs showed for years: a bundled local page, or an injected
+/// script that names it. Those get the name back, pointing at Pake's bridge
+/// (`core.invoke` and the current window).
+const GLOBAL_API_NAME: &str =
+    "if (!window.__TAURI__) { window.__TAURI__ = window.__PAKE_NATIVE__; }";
+/// A local app's own pages only: a site it links out to stays without the name.
+const GLOBAL_API_NAME_ON_LOCAL_PAGES: &str = "if (!window.__TAURI__ && (location.protocol === 'tauri:' || location.hostname === 'tauri.localhost')) { window.__TAURI__ = window.__PAKE_NATIVE__; }";
+
+fn global_api_name_script(url_type: &str, custom_js: &str) -> Option<&'static str> {
+    if custom_js.contains("__TAURI__") {
+        Some(GLOBAL_API_NAME)
+    } else if url_type == "local" {
+        Some(GLOBAL_API_NAME_ON_LOCAL_PAGES)
+    } else {
+        None
+    }
+}
+
+/// Whether a page's new-window request gets a window of its own: always with
+/// `--new-window`, and without it for a blank popup and for one that asks for
+/// a size.
+fn builds_requested_popup(allow_new_window: bool, target_url: &Url, sized: bool) -> bool {
+    allow_new_window || is_blank_popup_url(target_url) || sized
+}
+
+#[cfg(test)]
+mod popup_tests {
+    use super::{
+        builds_requested_popup, global_api_name_script, is_blank_popup_url, popup_build_url,
+        GLOBAL_API_NAME, GLOBAL_API_NAME_ON_LOCAL_PAGES,
+    };
+    use tauri::Url;
+
+    #[test]
+    fn an_internal_new_tab_link_never_bubbles_as_blank() {
+        // tauri-plugin-shell's own click listener opens every target="_blank"
+        // link in the system browser, handled by the page or not. The click
+        // guard must retarget before it asks about --new-window, and the
+        // in-app window must wait for the end of the bubble.
+        let script = include_str!("../inject/event.js").replace("\r\n", "\n");
+        let retarget = script
+            .find("anchorElement.target = \"_self\";\n    if (window.pakeConfig?.new_window) {")
+            .expect("the link is retargeted under every setting");
+        let pending = script[retarget..]
+            .find("pendingBlankLink = {")
+            .expect("--new-window leaves the open to the end of the bubble");
+        assert!(pending < 200);
+        // Both new-tab targets go through it.
+        assert_eq!(
+            script
+                .matches("keepInternalNewTabLinkInApp(e, anchorElement, absoluteUrl);")
+                .count(),
+            2
+        );
+        assert!(
+            script.contains("if (!pending || pending.event !== e || e.defaultPrevented) return;")
+        );
+        assert!(script.contains("window.addEventListener(\"click\", openUnhandledBlankLink);"));
+    }
+
+    #[test]
+    fn a_sign_in_path_on_another_site_needs_a_sign_in_request() {
+        // Outlook opens every link in a mail with window.open. A link to
+        // another site's /login replaced the mail page, because any sign-in
+        // path on any site counted as the app's own sign-in. The behaviour is
+        // tested in tests/unit/auth-sso-patterns.test.js; this keeps the gate.
+        let script = include_str!("../inject/auth.js").replace("\r\n", "\n");
+        assert!(script.contains(
+            "const isMatch = providerHost || (signInPath && signsInToThisSite(urlObj));"
+        ));
+        for param in [
+            "\"client_id\",",
+            "\"redirect_uri\",",
+            "\"samlrequest\",",
+            "\"wreply\",",
+        ] {
+            assert!(script.contains(param), "{param} marks a sign-in request");
+        }
+        // A vendor's own website is not a tenant's sign-in.
+        assert!(script.contains("/^(?!www\\.)[a-z0-9-]+\\.okta\\.com$/,"));
+        assert!(!script.contains("/(^|\\.)okta\\.com$/"));
+    }
+
+    #[test]
+    fn a_new_tab_link_without_an_address_never_bubbles_as_blank() {
+        // Douyin's episode covers have no href when the click begins and get
+        // "undefined" from the page's own handler during it. The click guard
+        // must take the _blank target away before it looks for an address, or
+        // tauri-plugin-shell's listener opens that address in the browser.
+        let script = include_str!("../inject/event.js").replace("\r\n", "\n");
+        let held = script
+            .find("!anchorElement.href &&\n      anchorElement.target === \"_blank\"")
+            .expect("a link with no address is looked at");
+        let with_address = script
+            .find("if (anchorElement && anchorElement.href) {")
+            .expect("links with an address follow");
+        assert!(held < with_address);
+        let hold = script
+            .find("const holdAddresslessNewTabLink = (e, anchorElement) => {")
+            .expect("the link is held for the click");
+        let retarget = script[hold..]
+            .find("anchorElement.target = \"_self\";")
+            .expect("its new-tab target is taken away");
+        assert!(retarget < 120);
+        assert!(script.contains("routeLateNewTabLink(e, pending.anchor);"));
+    }
+
+    #[test]
+    fn a_site_sees_no_tauri_global_api_and_the_users_own_code_keeps_the_name() {
+        // DeepSeek reads `"__TAURI__" in window` and warns of an abnormal
+        // environment, so Tauri must not define it; Pake's own scripts are
+        // held to that in tests/unit/native-bridge.test.js.
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        assert_eq!(conf["app"]["withGlobalTauri"], serde_json::json!(false));
+        assert_eq!(global_api_name_script("web", ""), None);
+        assert_eq!(global_api_name_script("web", "document.title = 'x';"), None);
+        let calls_it = "window.__TAURI__.core.invoke('set_zoom', { percent: 90 });";
+        assert_eq!(
+            global_api_name_script("web", calls_it),
+            Some(GLOBAL_API_NAME)
+        );
+        assert_eq!(
+            global_api_name_script("local", calls_it),
+            Some(GLOBAL_API_NAME)
+        );
+        // A bundled local page is the user's own code, with no site to object;
+        // a site that page links out to is still a site.
+        assert_eq!(
+            global_api_name_script("local", ""),
+            Some(GLOBAL_API_NAME_ON_LOCAL_PAGES)
+        );
+        assert!(GLOBAL_API_NAME_ON_LOCAL_PAGES.contains("location.protocol === 'tauri:'"));
+        assert!(GLOBAL_API_NAME.contains("window.__TAURI__ = window.__PAKE_NATIVE__"));
+    }
+
+    #[test]
+    fn a_popup_web_view_is_built_blank_so_the_engine_loads_its_address_once() {
+        let google = Url::parse("https://accounts.google.com/gsi/select?client_id=1").unwrap();
+        let built = popup_build_url(&google);
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            // A second, app-made load of the address drops window.opener.
+            assert_eq!(built.as_str(), "about:blank");
+        } else {
+            assert_eq!(built, google);
+        }
+    }
+
+    #[test]
+    fn a_sized_popup_is_built_at_its_address_without_new_window() {
+        // X signs in with Google through a sized popup. Built blank and sent
+        // to its address afterwards, it lost its opener to X's
+        // Cross-Origin-Opener-Policy and ended on a blank page.
+        let google = Url::parse("https://accounts.google.com/gsi/select?client_id=1").unwrap();
+        assert!(builds_requested_popup(false, &google, true));
+        assert!(!builds_requested_popup(false, &google, false));
+        assert!(builds_requested_popup(true, &google, false));
+        assert!(builds_requested_popup(
+            false,
+            &Url::parse("about:blank").unwrap(),
+            false
+        ));
+    }
+
+    #[test]
+    fn only_blank_documents_get_the_default_popup_exception() {
+        for input in ["about:blank", "about:blank#download", "about:blank?pending"] {
+            assert!(is_blank_popup_url(&Url::parse(input).unwrap()));
+        }
+        for input in [
+            "https://example.com/",
+            "about:srcdoc",
+            "about:blankness",
+            "file:///tmp/file",
+        ] {
+            assert!(!is_blank_popup_url(&Url::parse(input).unwrap()));
+        }
+    }
+}
+
+fn open_requested_window(
+    app: &AppHandle,
+    config: &PakeConfig,
+    tauri_config: &Config,
+    target_url: Url,
+    features: NewWindowFeatures,
+) -> tauri::Result<WebviewWindow> {
+    let state = app.state::<MultiWindowState>();
+    let label = state.next_popup_label();
+    let window = build_window(
+        app,
+        config,
+        tauri_config,
+        WindowBuildOptions {
+            label: &label,
+            url: WebviewUrl::External(popup_build_url(&target_url)),
+            visible: true,
+            new_window_features: Some(features),
+        },
+    )?;
+
+    // A blank popup keeps the app's title until its page has one.
+    if let Some(host) = target_url.host_str() {
+        let _ = window.set_title(host);
+    }
+    reapply_window_icon(&window);
+    let _ = window.set_focus();
+
+    Ok(window)
+}
+
+/// Open a multi-window clone of the home app. The window is built hidden and
+/// revealed on its first real page load (see `lib.rs` on_page_load) so Cmd+N
+/// does not flash an empty shell the way the main window used to.
+pub fn open_additional_window_safe(app: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    {
+        let app_handle = app.clone();
+        std::thread::spawn(move || {
+            if let Ok(window) = open_additional_window(&app_handle) {
+                // Fallback if PageLoadEvent::Finished never arrives.
+                let fallback = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(3_000)).await;
+                    reveal_built_window(&fallback);
+                });
+            }
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(window) = open_additional_window(app) {
+            let fallback = window.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(3_000)).await;
+                reveal_built_window(&fallback);
+            });
+        }
+    }
+}
+
+/// Show a window that was built hidden once content is ready (or the fallback
+/// timer fires). No-ops when already visible so page-load and fallback can race.
+pub fn reveal_built_window(window: &WebviewWindow) {
+    if window.is_visible().unwrap_or(true) {
+        return;
+    }
+    let _ = window.show();
+    reapply_window_icon(window);
+    #[cfg(target_os = "macos")]
+    enter_configured_fullscreen(window);
+    let _ = window.set_focus();
+}
+
+/// Puts a window into full screen the first time it is shown when the app is set to
+/// start in full screen. Once per window, so a window the user took out of full
+/// screen stays out when it is hidden and shown again.
+#[cfg(target_os = "macos")]
+pub fn enter_configured_fullscreen(window: &WebviewWindow) {
+    static ENTERED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let configured = window
+        .app_handle()
+        .try_state::<MultiWindowState>()
+        .is_some_and(|state| state.pake_config.windows[0].fullscreen);
+    let Ok(mut entered) = ENTERED.lock() else {
+        return;
+    };
+    let label = window.label().to_string();
+    let first_show = !entered.contains(&label);
+    if crate::util::enters_fullscreen_on_show(
+        configured,
+        first_show,
+        window.is_fullscreen().unwrap_or(false),
+    ) {
+        let _ = window.set_fullscreen(true);
+    }
+    if configured && first_show {
+        entered.push(label);
+    }
+}
+
+/// True when any Pake webview window is currently on screen.
+///
+/// A minimized window does not count. Windows keeps `IsWindowVisible` true while
+/// a window is iconic, and `hide_on_close` minimizes before hiding, so treating
+/// minimized as visible makes the tray toggle hide an already-invisible window
+/// instead of restoring it (#1343).
+pub fn any_app_window_visible(app: &AppHandle) -> bool {
+    app.webview_windows().values().any(|window| {
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
+    })
+}
+
+/// Hide every webview window (main + multi-window clones). Used by tray Hide
+/// and the activation shortcut so secondary windows are not left on screen.
+pub fn hide_all_app_windows(app: &AppHandle) {
+    for window in app.webview_windows().values() {
+        let _ = window.hide();
+    }
+}
+
+/// Show every webview window, reassert icons, and focus the main window.
+pub fn show_all_app_windows(app: &AppHandle, init_fullscreen: bool) {
+    let windows = app.webview_windows();
+    for window in windows.values() {
+        let _ = window.unminimize();
+        let _ = window.show();
+        reapply_window_icon(window);
+        #[cfg(target_os = "linux")]
+        if init_fullscreen && !window.is_fullscreen().unwrap_or(false) {
+            let _ = window.set_fullscreen(true);
+        }
+        #[cfg(target_os = "macos")]
+        enter_configured_fullscreen(window);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = init_fullscreen;
+
+    if let Some(main) = windows.get("pake") {
+        let _ = main.set_focus();
+    } else if let Some(any) = windows.values().next() {
+        let _ = any.set_focus();
+    }
+}
+
+/// Tray-click / activation-shortcut toggle: hide all if anything is visible,
+/// otherwise show all. Cancels startup reveal when the caller has already done
+/// so; this helper only touches visibility.
+pub fn toggle_all_app_windows(app: &AppHandle, init_fullscreen: bool) {
+    if any_app_window_visible(app) {
+        hide_all_app_windows(app);
+    } else {
+        show_all_app_windows(app, init_fullscreen);
+    }
+}
+
+/// The one window that shows an extension's own page. It is built like every
+/// other window of the app, since WebView2 wants the same settings for all
+/// webviews that share a data folder.
+#[cfg(target_os = "windows")]
+pub fn open_extension_window(app: &AppHandle, url: Url, title: &str) -> tauri::Result<()> {
+    const LABEL: &str = "extension-settings";
+    let window = match app.get_webview_window(LABEL) {
+        Some(window) => {
+            window.navigate(url)?;
+            window
+        }
+        None => {
+            let state = app.state::<MultiWindowState>();
+            build_window(
+                app,
+                &state.pake_config,
+                &state.tauri_config,
+                WindowBuildOptions {
+                    label: LABEL,
+                    url: WebviewUrl::External(url),
+                    visible: true,
+                    new_window_features: None,
+                },
+            )?
+        }
+    };
+    // A small plain window whatever the app's own window is set to be.
+    window.set_fullscreen(false)?;
+    window.unmaximize()?;
+    window.set_decorations(true)?;
+    window.set_always_on_top(false)?;
+    window.set_min_size(None::<tauri::LogicalSize<f64>>)?;
+    window.set_title(title)?;
+    window.set_size(tauri::LogicalSize::new(440.0, 640.0))?;
+    window.unminimize()?;
+    window.show()?;
+    window.set_focus()
+}
+
+fn build_window_with_label(
+    app: &AppHandle,
+    config: &PakeConfig,
+    tauri_config: &Config,
+    label: &str,
+) -> tauri::Result<WebviewWindow> {
+    let window_config = config.windows.first().ok_or_else(|| {
+        tauri::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pake.json must define at least one window configuration",
+        ))
+    })?;
+    let url = match window_config.url_type.as_str() {
+        "web" => {
+            let parsed = window_config.url.parse().map_err(|err| {
+                tauri::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Invalid 'web' url '{}' in pake.json: {err}",
+                        window_config.url
+                    ),
+                ))
+            })?;
+            WebviewUrl::App(parsed)
+        }
+        "local" => WebviewUrl::App(crate::app::local_site::entry_path(&window_config.url)),
+        other => {
+            return Err(tauri::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("url_type must be 'web' or 'local', got '{other}'"),
+            )));
+        }
+    };
+
+    build_window(
+        app,
+        config,
+        tauri_config,
+        WindowBuildOptions {
+            label,
+            url,
+            visible: false,
+            new_window_features: None,
+        },
+    )
+}
+
+fn build_window(
+    app: &AppHandle,
+    config: &PakeConfig,
+    tauri_config: &Config,
+    opts: WindowBuildOptions,
+) -> tauri::Result<WebviewWindow> {
+    let WindowBuildOptions {
+        label,
+        url,
+        visible,
+        new_window_features,
+    } = opts;
+    // A window a page opened: a sign-in popup, a blank two-stage one.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let page_popup = new_window_features.is_some();
+    #[cfg(target_os = "macos")]
+    let use_native_window_tabbing = config.multi_window && new_window_features.is_none();
+    #[cfg(target_os = "macos")]
+    let prefer_native_window_tabbing = use_native_window_tabbing && label != "pake";
+
+    let _data_dir =
+        get_data_dir(app, data_dir_name(config, tauri_config)).map_err(tauri::Error::Io)?;
+
+    let window_config = config.windows.first().ok_or_else(|| {
+        tauri::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pake.json must define at least one window configuration",
+        ))
+    })?;
+
+    let restored_url = if label == "pake" && window_config.remembers_last_url() {
+        match app.path().app_data_dir() {
+            Ok(directory) => match crate::util::read_last_url(&directory.join("last-url.txt")) {
+                Ok(url) => url,
+                Err(error) => {
+                    eprintln!("[Pake] Could not read the last URL: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!("[Pake] Could not locate the last URL: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // On macOS both HTTP Basic auth and certificate bypass use the same
+    // navigation-delegate proxy. Start on a neutral page so the proxy is in
+    // place before the target can issue its first authentication challenge.
+    #[cfg(target_os = "macos")]
+    let auth_target = if label == "pake"
+        && window_config.url_type == "web"
+        && (config.basic_auth || window_config.ignore_certificate_errors)
+    {
+        restored_url
+            .clone()
+            .or_else(|| Url::parse(&window_config.url).ok())
+    } else {
+        None
+    };
+
+    let url = restored_url.map(WebviewUrl::External).unwrap_or(url);
+
+    // Install the native download handler before a remote entry page can respond
+    // with an attachment. about:blank popups still keep their own WindowProxy.
+    #[cfg(target_os = "windows")]
+    let download_target = match &url {
+        WebviewUrl::External(target) if matches!(target.scheme(), "http" | "https") => {
+            Some(target.clone())
+        }
+        WebviewUrl::App(path) => path
+            .to_str()
+            .and_then(|path| Url::parse(path).ok())
+            .filter(|target| matches!(target.scheme(), "http" | "https")),
+        _ => None,
+    };
+    #[cfg(target_os = "windows")]
+    let url = if download_target.is_some() {
+        WebviewUrl::CustomProtocol(Url::parse("about:blank").map_err(|error| {
+            tauri::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+        })?)
+    } else {
+        url
+    };
+
+    // The delegate must be installed before the first TLS challenge. Start on
+    // a neutral page, then navigate from the with_webview callback below.
+    #[cfg(target_os = "macos")]
+    let url = if auth_target.is_some() {
+        WebviewUrl::CustomProtocol(
+            Url::parse("about:blank").expect("about:blank must be a valid URL"),
+        )
+    } else {
+        url
+    };
+
+    // With content blocking the main window starts blank, like the auth
+    // delegate above, and opens its page once the rule lists are in place.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        feature = "content-blocking"
+    ))]
+    let blocking_groups = crate::app::content_blocking::selected_groups(&config.content_blocking);
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        feature = "content-blocking"
+    ))]
+    let (url, blocked_target) = match web_target(&url) {
+        Some(target) if label == "pake" && !blocking_groups.is_empty() => (
+            WebviewUrl::CustomProtocol(
+                Url::parse("about:blank").expect("about:blank must be a valid URL"),
+            ),
+            Some(target),
+        ),
+        _ => (url, None),
+    };
+
+    // Extensions ride on the webview's configuration, which has to exist
+    // before the webview does. A page's popup takes the configuration WebKit
+    // made from its opener's, controller included.
+    #[cfg(target_os = "macos")]
+    let extension_configuration = match (&config.runtime_extensions, &new_window_features) {
+        (Some(directory), None) => {
+            crate::app::extensions::configuration(directory, window_config.incognito)
+        }
+        _ => None,
+    };
+    // The main window waits blank for them too, so its first page gets their
+    // content scripts. Already blank for content blocking, it leaves there.
+    #[cfg(target_os = "macos")]
+    let (url, extension_target) = match web_target(&url) {
+        Some(target) if label == "pake" && extension_configuration.is_some() => (
+            WebviewUrl::CustomProtocol(
+                Url::parse("about:blank").expect("about:blank must be a valid URL"),
+            ),
+            Some(target),
+        ),
+        _ => (url, None),
+    };
+
+    let user_agent = config.user_agent.get();
+
+    let config_script = format!(
+        "window.pakeConfig = {}",
+        page_config(
+            window_config,
+            extensions_run(config),
+            new_window_features.is_some()
+        )
+    );
+    // A host-provided marker avoids relying on a site's overridden user agent.
+    #[cfg(target_os = "windows")]
+    let config_script = format!("{config_script}; window.pakeNativeDownloads = true;");
+
+    // Platform-specific title: macOS prefers empty, others fallback to product name
+    let effective_title = window_config.title.as_deref().unwrap_or_else(|| {
+        if cfg!(target_os = "macos") {
+            ""
+        } else {
+            tauri_config.product_name.as_deref().unwrap_or("")
+        }
+    });
+
+    let mut window_builder = WebviewWindowBuilder::new(app, label, url)
+        .title(effective_title)
+        // Linux builds every window hidden and shows it once its title bar is in.
+        .visible(visible && !cfg!(target_os = "linux"))
+        .user_agent(user_agent)
+        .resizable(window_config.resizable)
+        .maximized(window_config.maximize);
+
+    // A size preset can be taller than the screen (the tablet one is 820x1180),
+    // so the first window fits the primary monitor's work area; a size the
+    // window-state plugin restores later is left as the user made it.
+    let monitor = app.primary_monitor().ok().flatten();
+    let scale_factor = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
+    let work_area = monitor.as_ref().map(|m| {
+        let size = m.work_area().size;
+        (f64::from(size.width), f64::from(size.height))
+    });
+
+    #[cfg(target_os = "windows")]
+    {
+        // The config size is read as physical pixels here, as before.
+        let (width, height) = crate::util::fit_to_work_area(
+            window_config.width,
+            window_config.height,
+            work_area,
+            TITLE_BAR_ALLOWANCE * scale_factor,
+        );
+        window_builder = window_builder.inner_size(width / scale_factor, height / scale_factor);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let (width, height) = crate::util::fit_to_work_area(
+            window_config.width,
+            window_config.height,
+            work_area.map(|(width, height)| (width / scale_factor, height / scale_factor)),
+            TITLE_BAR_ALLOWANCE,
+        );
+        window_builder = window_builder.inner_size(width, height);
+    }
+
+    window_builder = window_builder
+        .always_on_top(window_config.always_on_top)
+        .incognito(window_config.incognito);
+
+    // macOS enters full screen once the window is shown (`enter_configured_fullscreen`):
+    // tao gives a window built full screen the screen's frame as its own size, so
+    // leaving full screen kept the screen's size instead of the configured one.
+    #[cfg(target_os = "windows")]
+    {
+        window_builder = window_builder.fullscreen(window_config.fullscreen);
+    }
+
+    if window_config.min_width > 0.0 || window_config.min_height > 0.0 {
+        let min_w = if window_config.min_width > 0.0 {
+            window_config.min_width
+        } else {
+            window_config.width
+        };
+        let min_h = if window_config.min_height > 0.0 {
+            window_config.min_height
+        } else {
+            window_config.height
+        };
+        window_builder = window_builder.min_inner_size(min_w, min_h);
+    }
+
+    // Tauri's drag-drop handler takes file drops before the page and breaks
+    // HTML5 drag and drop on Windows; nothing in Pake consumes its events.
+    window_builder = window_builder.disable_drag_drop_handler();
+
+    {
+        let allow_new_window = window_config.new_window;
+        let app_handle = app.clone();
+        let popup_config = config.clone();
+        let popup_tauri_config = tauri_config.clone();
+        window_builder = window_builder.on_new_window(move |target_url, features| {
+            // Even without --new-window, two-stage popups need a real webview
+            // with our download delegate, never a proxy for the main window.
+            // So does a popup that asks for a size: the injected scripts send
+            // only a sign-in popup or one of the app's own site here sized,
+            // and it must start at its address to keep its opener (WebKitGTK
+            // reports no size, so Linux is unchanged).
+            if !builds_requested_popup(allow_new_window, &target_url, features.size().is_some()) {
+                return NewWindowResponse::Deny;
+            }
+            match open_requested_window(
+                &app_handle,
+                &popup_config,
+                &popup_tauri_config,
+                target_url,
+                features,
+            ) {
+                Ok(window) => NewWindowResponse::Create { window },
+                Err(error) => {
+                    eprintln!("[Pake] Failed to open requested window: {error}");
+                    NewWindowResponse::Deny
+                }
+            }
+        });
+    }
+
+    // Add initialization scripts. Order matters: pakeConfig must land before
+    // any script that reads it, and toast must register `window.pakeToast`
+    // before Rust code calls show_toast().
+    window_builder = window_builder
+        .initialization_script_for_all_frames(&config_script)
+        .initialization_script_for_all_frames(include_str!("../inject/link_policy.js"))
+        .initialization_script_for_all_frames(include_str!("../inject/auth.js"))
+        .initialization_script_for_all_frames(include_str!("../inject/frame_links.js"));
+
+    // find.js is opt-in via --enable-find and no-ops at runtime when disabled,
+    // so only inject its ~700 lines when the feature is on. Avoids parsing the
+    // find UI on every page load in the common (find-off) case. Matches the
+    // enable_find gating already applied to the Find menu item.
+    window_builder = window_builder
+        .initialization_script(include_str!("../inject/bridge.js"))
+        .initialization_script(include_str!("../inject/styles.js"));
+
+    if window_config.enable_find {
+        window_builder = window_builder.initialization_script(include_str!("../inject/find.js"));
+    }
+
+    window_builder = window_builder.initialization_script(include_str!("../inject/toast.js"));
+
+    // WebView2's native Fullscreen API already drives Tauri's window fullscreen.
+    // Keep its top-layer layout and player controls instead of overriding the API.
+    #[cfg(not(target_os = "windows"))]
+    {
+        window_builder =
+            window_builder.initialization_script(include_str!("../inject/fullscreen.js"));
+    }
+
+    window_builder = window_builder
+        .initialization_script(include_str!("../inject/event.js"))
+        .initialization_script(include_str!("../inject/style.js"))
+        .initialization_script(include_str!("../inject/theme_refresh.js"));
+
+    #[cfg(target_os = "macos")]
+    if window_config.title_bar_follows_page() {
+        window_builder =
+            window_builder.initialization_script(include_str!("../inject/title_bar.js"));
+    }
+
+    #[cfg(target_os = "macos")]
+    if crate::app::passkey::enabled(
+        window_config.incognito,
+        window_config.ignore_certificate_errors,
+    ) {
+        window_builder = window_builder.initialization_script(include_str!("../inject/passkey.js"));
+    }
+
+    let custom_js = config
+        .runtime_custom_js
+        .as_deref()
+        .unwrap_or(include_str!("../inject/custom.js"));
+    if let Some(script) = global_api_name_script(&window_config.url_type, custom_js) {
+        window_builder = window_builder.initialization_script(script);
+    }
+    window_builder = window_builder.initialization_script(custom_js);
+
+    #[cfg(target_os = "windows")]
+    let mut windows_browser_args = String::from("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-blink-features=AutomationControlled");
+
+    #[cfg(target_os = "linux")]
+    let mut linux_browser_args = String::from("--disable-blink-features=AutomationControlled");
+
+    if window_config.ignore_certificate_errors {
+        #[cfg(target_os = "windows")]
+        {
+            windows_browser_args.push_str(" --ignore-certificate-errors");
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            linux_browser_args.push_str(" --ignore-certificate-errors");
+        }
+    }
+
+    if window_config.enable_wasm {
+        #[cfg(target_os = "windows")]
+        {
+            windows_browser_args.push_str(" --enable-features=SharedArrayBuffer");
+            windows_browser_args.push_str(" --enable-unsafe-webgpu");
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            linux_browser_args.push_str(" --enable-features=SharedArrayBuffer");
+            linux_browser_args.push_str(" --enable-unsafe-webgpu");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            window_builder = window_builder
+                .additional_browser_args("--enable-features=SharedArrayBuffer")
+                .additional_browser_args("--enable-unsafe-webgpu");
+        }
+    }
+
+    let mut parsed_proxy_url: Option<Url> = None;
+
+    // Default to following the system theme (None), only force dark when explicitly set.
+    // Computed once; the matching platform block below is the sole consumer.
+    let theme = if window_config.dark_mode {
+        Some(Theme::Dark)
+    } else {
+        None // Follow system theme
+    };
+
+    // Platform-specific configuration must be set before proxy on Windows/Linux
+    #[cfg(target_os = "macos")]
+    {
+        let title_bar_style = if window_config.hide_title_bar {
+            TitleBarStyle::Overlay
+        } else if window_config.title_bar_follows_page() {
+            // The page starts below the bar, so the traffic lights never cover
+            // it; title_bar.js paints the bar with the page's top color.
+            TitleBarStyle::Transparent
+        } else {
+            TitleBarStyle::Visible
+        };
+        window_builder = window_builder.title_bar_style(title_bar_style);
+        if window_config.title_bar_follows_page() {
+            window_builder = window_builder.hidden_title(true);
+            // Open in the color title_bar.js last painted, so the bar does not
+            // flash the default white before the page reports its own.
+            if label == "pake" {
+                if let Some((red, green, blue)) =
+                    app.path().app_data_dir().ok().and_then(|directory| {
+                        crate::util::read_title_bar_color(&directory.join(TITLE_BAR_COLOR_FILE))
+                    })
+                {
+                    window_builder = window_builder
+                        .background_color(tauri::window::Color(red, green, blue, 255));
+                }
+            }
+        }
+        window_builder = window_builder.theme(theme);
+
+        // Tauri disables automatic tabbing unless an identifier is provided.
+        // Existing multi-window apps already have a stable bundle identifier,
+        // so use it without exposing another CLI/config option. Web-created
+        // popups keep their own native window.
+        if use_native_window_tabbing {
+            window_builder = window_builder
+                .tabbing_identifier(&tauri_config.identifier)
+                .on_document_title_changed(|window, title| {
+                    if !title.trim().is_empty() {
+                        if let Err(error) = window.set_title(&title) {
+                            eprintln!("[Pake] Failed to update the macOS tab title: {error}");
+                        }
+                    }
+                });
+        }
+    }
+
+    // Windows and Linux: set data_directory before proxy_url
+    #[cfg(not(target_os = "macos"))]
+    {
+        window_builder = window_builder.data_directory(_data_dir).theme(theme);
+
+        if window_config.hide_window_decorations {
+            window_builder = window_builder.decorations(false);
+        }
+
+        if !config.proxy_url.is_empty() {
+            if let Ok(proxy_url) = Url::from_str(&config.proxy_url) {
+                parsed_proxy_url = Some(proxy_url.clone());
+                #[cfg(target_os = "windows")]
+                {
+                    if let Some(arg) = build_proxy_browser_arg(&proxy_url) {
+                        windows_browser_args.push(' ');
+                        windows_browser_args.push_str(&arg);
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            window_builder = window_builder.additional_browser_args(&windows_browser_args);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            window_builder = window_builder.additional_browser_args(&linux_browser_args);
+        }
+    }
+
+    // Set proxy after platform-specific configs (required for Windows/Linux)
+    if parsed_proxy_url.is_none() && !config.proxy_url.is_empty() {
+        if let Ok(proxy_url) = Url::from_str(&config.proxy_url) {
+            parsed_proxy_url = Some(proxy_url);
+        }
+    }
+
+    if let Some(proxy_url) = parsed_proxy_url {
+        window_builder = window_builder.proxy_url(proxy_url);
+        #[cfg(debug_assertions)]
+        println!("Proxy configured: {}", config.proxy_url);
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(configuration) = extension_configuration {
+        window_builder = window_builder.with_webview_configuration(configuration);
+    }
+
+    // WebView2 keeps one setting per data folder, so every window of the app
+    // turns extensions on, a page's popup included.
+    #[cfg(target_os = "windows")]
+    if config.runtime_extensions.is_some() {
+        window_builder = window_builder.browser_extensions_enabled(true);
+    }
+
+    if let Some(features) = new_window_features {
+        #[cfg(target_os = "macos")]
+        prepare_macos_new_window_configuration(&features)?;
+
+        window_builder = window_builder.window_features(features).focused(true);
+        // A popup that starts blank and is then sent to its address has no
+        // title of its own; it takes its page's, as a browser's popup does.
+        window_builder = window_builder.on_document_title_changed(|window, title| {
+            if !title.trim().is_empty() {
+                if let Err(error) = window.set_title(&title) {
+                    eprintln!("[Pake] Failed to update the popup title: {error}");
+                }
+            }
+        });
+    }
+
+    // Capture webview-initiated downloads (blob:, data:, Content-Disposition,
+    // etc.) and write them to the configured download folder. This is essential for
+    // sites with a strict Content-Security-Policy (e.g. Gemini): their
+    // `connect-src` blocks Tauri's IPC origin, so downloads cannot be routed
+    // through the JS bridge, and downloads triggered from a sandboxed iframe
+    // can't reach the IPC either. Letting the browser download natively and
+    // catching it here is independent of the page CSP and the IPC channel.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let download_handle = app.clone();
+        // WKWebView reports no path when a download finishes, so remember where each was sent.
+        let destinations: std::sync::Mutex<std::collections::HashMap<String, PathBuf>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        window_builder = window_builder.on_download(move |webview, event| match event {
+            DownloadEvent::Requested { url, destination } => {
+                match get_download_dir(&download_handle) {
+                    Ok(download_dir) => {
+                        let filename = destination
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .filter(|name| !name.is_empty())
+                            .or_else(|| {
+                                url.path_segments()
+                                    .and_then(|mut segments| segments.next_back())
+                                    .map(|segment| segment.to_string())
+                                    .filter(|segment| !segment.is_empty())
+                            })
+                            .unwrap_or_else(|| "download".to_string());
+
+                        let target = download_dir.join(sanitize_download_filename(&filename));
+                        if let Some(path_str) = target.to_str() {
+                            *destination = PathBuf::from(check_file_or_append(path_str));
+                            if let Ok(mut sent) = destinations.lock() {
+                                sent.insert(url.to_string(), destination.clone());
+                            }
+                        } else {
+                            eprintln!("[Pake] Download destination is not valid UTF-8");
+                            return false;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[Pake] Failed to resolve download dir: {error}");
+                        if let Some(window) = download_handle.get_webview_window(webview.label()) {
+                            show_toast(
+                                &window,
+                                &get_download_message_with_lang(
+                                    MessageType::DirectoryFailure,
+                                    None,
+                                ),
+                            );
+                        }
+                        return false;
+                    }
+                }
+                true
+            }
+            DownloadEvent::Finished { url, path, success } => {
+                let saved = destinations
+                    .lock()
+                    .ok()
+                    .and_then(|mut sent| sent.remove(url.as_str()))
+                    .or(path);
+                // Toast on the window that started the download (including
+                // secondary multi-window labels), not a hard-coded "pake".
+                let toast_window = download_handle
+                    .get_webview_window(webview.label())
+                    .or_else(|| download_handle.get_webview_window("pake"));
+                if let Some(window) = toast_window {
+                    if success {
+                        crate::util::show_download_finished(&window, saved, None);
+                    } else {
+                        show_toast(
+                            &window,
+                            &get_download_message_with_lang(MessageType::Failure, None),
+                        );
+                    }
+                }
+                true
+            }
+            _ => true,
+        });
+    }
+
+    window_builder = window_builder.on_navigation(|_| true);
+
+    let window = window_builder.build()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        if !window_config.hide_window_decorations {
+            crate::app::header_bar::install(&window);
+        }
+        if visible {
+            window.show()?;
+        }
+    }
+
+    // A popup is built visible, so it can enter full screen now; a hidden window
+    // enters when it is first shown.
+    #[cfg(target_os = "macos")]
+    if visible {
+        enter_configured_fullscreen(&window);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let password_autosave = window_config.password_autosave_enabled();
+        if let Err(error) = window.with_webview(move |webview| {
+            set_password_autosave(&webview, password_autosave);
+        }) {
+            eprintln!("[Pake] Failed to access WebView2 for password autosave: {error}");
+        }
+    }
+
+    // Before download::install navigates: WebView2 only raises request events
+    // for filters added ahead of the first navigation.
+    #[cfg(all(target_os = "windows", feature = "content-blocking"))]
+    if !config.content_blocking.is_empty() {
+        let names = config.content_blocking.clone();
+        if let Err(error) = window.with_webview(move |webview| {
+            crate::app::content_blocking::install(&webview, &names);
+        }) {
+            eprintln!("[Pake] Failed to access WebView2 for content blocking: {error}");
+        }
+    }
+
+    // The first window adds the extensions to the profile and opens its page
+    // once they are in; a later window finds them there already.
+    #[cfg(target_os = "windows")]
+    let (download_target, extension_target) = match &config.runtime_extensions {
+        Some(_) if label == "pake" => (None, download_target),
+        _ => (download_target, None),
+    };
+
+    #[cfg(target_os = "windows")]
+    crate::app::download::install(&window, download_target)?;
+
+    #[cfg(target_os = "windows")]
+    if let Some(directory) = &config.runtime_extensions {
+        if label == "pake" {
+            crate::app::extensions::install(
+                &window,
+                directory.clone(),
+                extension_target,
+                window_config.incognito,
+            )?;
+        }
+    }
+
+    // Every webview is built here, so every one can be asked for the camera and microphone.
+    #[cfg(target_os = "linux")]
+    if let Err(error) = window.with_webview(|webview| {
+        crate::app::media_permission::install(&webview);
+        crate::app::recovery::install(&webview);
+    }) {
+        eprintln!("[Pake] Failed to access WebKitGTK for media permissions and recovery: {error}");
+    }
+
+    // Every webview passes here, popups included, whose content controller
+    // macOS replaces (prepare_macos_new_window_configuration), so each gets the lists.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        feature = "content-blocking"
+    ))]
+    if !blocking_groups.is_empty() {
+        #[cfg(target_os = "linux")]
+        if let Ok(directory) = app.path().app_data_dir() {
+            crate::app::content_blocking::set_store_dir(directory);
+        }
+        let groups = blocking_groups.clone();
+        let opener = window.clone();
+        if let Err(error) = window.with_webview(move |webview| {
+            crate::app::content_blocking::install(&webview, groups);
+            if let Some(target) = blocked_target {
+                crate::app::content_blocking::when_ready(Box::new(move || {
+                    let open = move || {
+                        if let Err(error) = opener.navigate(target) {
+                            eprintln!("[Pake] Failed to open the page: {error}");
+                        }
+                    };
+                    #[cfg(target_os = "macos")]
+                    crate::app::extensions::when_ready(Box::new(open));
+                    #[cfg(not(target_os = "macos"))]
+                    open();
+                }));
+            }
+        }) {
+            eprintln!("[Pake] Failed to access the webview for content blocking: {error}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if config.runtime_extensions.is_some() {
+        let opener = window.clone();
+        if let Err(error) = window.with_webview(move |webview| {
+            // SAFETY: with_webview runs on the main thread with a live WKWebView.
+            crate::app::extensions::register(unsafe {
+                &*(webview.inner() as *const objc2::runtime::AnyObject)
+            });
+            if let Some(target) = extension_target {
+                crate::app::extensions::when_ready(Box::new(move || {
+                    if let Err(error) = opener.navigate(target) {
+                        eprintln!("[Pake] Failed to open the page: {error}");
+                    }
+                }));
+            }
+        }) {
+            eprintln!("[Pake] Failed to access the webview for extensions: {error}");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Err(error) = window.with_webview(|webview| {
+        crate::app::recovery::install(&webview);
+    }) {
+        eprintln!("[Pake] Failed to access the web view for crash recovery: {error}");
+    }
+
+    // Every webview is built here (main window, Cmd+N clones, --new-window and
+    // blank two-stage popups), so trackpad history swipes match in all of them.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = window.with_webview(|webview| {
+        crate::app::navigation::enable_back_forward_gestures(&webview);
+    }) {
+        eprintln!("[Pake] Failed to access WKWebView for history swipe gestures: {error}");
+    }
+
+    // A popup's page closes it with window.close() once it has answered its
+    // opener, and WKWebView closes nothing unless its UI delegate does.
+    #[cfg(target_os = "macos")]
+    if page_popup {
+        let popup_app = app.clone();
+        let popup_label = label.to_string();
+        if let Err(error) = window.with_webview(move |webview| {
+            crate::app::popup_close::install(&popup_app, &popup_label, &webview);
+        }) {
+            eprintln!("[Pake] Failed to access WKWebView for its popup close: {error}");
+        }
+    }
+
+    // WebView2 raises WindowCloseRequested for the same call, and Wry answers
+    // by destroying the web view's own container, which left the popup's frame
+    // on screen with nothing in it (measured in a Windows 11 VM).
+    #[cfg(target_os = "windows")]
+    if page_popup {
+        let popup = window.clone();
+        if let Err(error) = window.with_webview(move |webview| {
+            use webview2_com::WindowCloseRequestedEventHandler;
+            let result = unsafe {
+                (move || -> windows_core::Result<()> {
+                    let core = webview.controller().CoreWebView2()?;
+                    let mut token = 0;
+                    core.add_WindowCloseRequested(
+                        &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| {
+                            if let Err(error) = popup.close() {
+                                eprintln!(
+                                    "[Pake] Failed to close the popup its page closed: {error}"
+                                );
+                            }
+                            Ok(())
+                        })),
+                        &mut token,
+                    )
+                })()
+            };
+            if let Err(error) = result {
+                eprintln!("[Pake] Failed to watch for a popup closing itself: {error}");
+            }
+        }) {
+            eprintln!("[Pake] Failed to access WebView2 for its popup close: {error}");
+        }
+    }
+
+    // A page's alert(), confirm() and prompt() show nothing in a WKWebView
+    // unless its UI delegate answers, and Wry's does not: every window's does.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = window.with_webview(|webview| {
+        crate::app::script_dialogs::install(&webview);
+    }) {
+        eprintln!("[Pake] Failed to access WKWebView for its script dialogs: {error}");
+    }
+
+    // WKWebView refuses WebAuthn in this app, so the runtime answers passkey.js itself.
+    #[cfg(target_os = "macos")]
+    if crate::app::passkey::enabled(
+        window_config.incognito,
+        window_config.ignore_certificate_errors,
+    ) {
+        if let Ok(directory) = app.path().app_data_dir() {
+            let store = directory.join(crate::app::passkey::STORE_FILE);
+            if let Err(error) = window.with_webview(move |webview| {
+                crate::app::passkey::install(&webview, store);
+            }) {
+                eprintln!("[Pake] Failed to access WKWebView for passkeys: {error}");
+            }
+        }
+    }
+
+    // The tab bar's + button exists only while some window class answers
+    // `newWindowForTab:`. Install it for every tabbing window, the main one
+    // included: its tab bar is the one the user sees first.
+    #[cfg(target_os = "macos")]
+    if use_native_window_tabbing {
+        crate::app::tab_bar::install_new_tab_action(app, &window);
+    }
+
+    #[cfg(target_os = "macos")]
+    if window_config.navigation_buttons {
+        crate::app::nav_buttons::install(app, &window);
+    }
+
+    // A shared identifier alone leaves each NSWindow in automatic mode.
+    // Prefer tabs only for Cmd+N clones so they join the main window's tab
+    // group. The main window stays bar-less until another tab exists, while
+    // web-auth and window.open popups remain separate native windows.
+    #[cfg(target_os = "macos")]
+    if prefer_native_window_tabbing {
+        let tabbing_window = window.clone();
+        Queue::main().exec_async(move || match tabbing_window.ns_window() {
+            Ok(ns_window_ptr) => unsafe {
+                let Some(ns_window) =
+                    objc2::rc::Retained::retain(ns_window_ptr as *mut objc2_app_kit::NSWindow)
+                else {
+                    eprintln!("[Pake] Failed to retain the macOS window for tabbing.");
+                    return;
+                };
+                ns_window.setTabbingMode(objc2_app_kit::NSWindowTabbingMode::Preferred);
+            },
+            Err(error) => {
+                eprintln!("[Pake] Failed to access the macOS window for tabbing: {error}");
+            }
+        });
+    }
+
+    // WKWebView does not show an HTTP Basic login dialog and ignores Chromium's
+    // certificate-error flag. Install one host-scoped delegate for both flows
+    // on the process-lifetime main window, then navigate to the real target.
+    #[cfg(target_os = "macos")]
+    if let Some(target_url) = auth_target {
+        let allowed_host = target_url
+            .host_str()
+            .expect("web URLs must have a host")
+            .to_owned();
+        let prompt_for_basic_auth = config.basic_auth;
+        let allow_invalid_certificates = window_config.ignore_certificate_errors;
+        let auth_window = window.clone();
+        #[cfg(feature = "content-blocking")]
+        let wait_for_lists = !blocking_groups.is_empty();
+        #[cfg(not(feature = "content-blocking"))]
+        let wait_for_lists = false;
+        let navigate = move || {
+            if let Err(error) = auth_window.with_webview(move |webview| {
+                if !crate::app::auth::install_auth_delegate_and_navigate(
+                    webview.inner(),
+                    allowed_host,
+                    target_url.to_string(),
+                    prompt_for_basic_auth,
+                    allow_invalid_certificates,
+                ) {
+                    eprintln!("[Pake] Failed to configure macOS authentication handling.");
+                }
+            }) {
+                eprintln!("[Pake] Failed to access the macOS webview: {error}");
+            }
+        };
+        Queue::main().exec_async(move || {
+            // Runs at once when the app has no extensions.
+            let navigate = move || crate::app::extensions::when_ready(Box::new(navigate));
+            #[cfg(feature = "content-blocking")]
+            if wait_for_lists {
+                crate::app::content_blocking::when_ready(Box::new(navigate));
+                return;
+            }
+            let _ = wait_for_lists;
+            navigate();
+        });
+    }
+
+    Ok(window)
+}
+
+/// The http or https page a window opens, whichever way its URL is held.
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "content-blocking")
+))]
+fn web_target(url: &WebviewUrl) -> Option<Url> {
+    let target = match url {
+        WebviewUrl::External(target) => Some(target.clone()),
+        WebviewUrl::App(path) => path.to_str().and_then(|path| Url::parse(path).ok()),
+        _ => None,
+    }?;
+    matches!(target.scheme(), "http" | "https").then_some(target)
+}
+
+/// The address a window is showing, or `None` when it shows none. On macOS a
+/// WKWebView whose web content process has died has no URL, and Wry's getter
+/// unwrapped it through 0.54.2: `window.url()` there was a panic, which the
+/// release profile turned into the app aborting (a user quit an app whose page
+/// had gone white and got a crash report, 2026-11-18). Wry 0.57 returns an
+/// error instead; the web view is still asked first, so this stays the one
+/// reader whatever Wry does.
+pub fn page_url(window: &WebviewWindow) -> Option<Url> {
+    #[cfg(target_os = "macos")]
+    {
+        let (answer, has_url) = std::sync::mpsc::channel();
+        let asked = window.with_webview(move |webview| {
+            let view = webview.inner() as *mut objc2::runtime::AnyObject;
+            let url: *mut objc2::runtime::AnyObject = if view.is_null() {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: Tauri runs this on the main thread with the live WKWebView.
+                unsafe { objc2::msg_send![view, URL] }
+            };
+            let _ = answer.send(!url.is_null());
+        });
+        let shows_a_page = asked.is_ok()
+            && has_url
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .unwrap_or(false);
+        if !shows_a_page {
+            return None;
+        }
+    }
+    window.url().ok()
+}
+
+pub fn save_last_url(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("pake") else {
+        return;
+    };
+    let Some(url) = page_url(&window) else {
+        return;
+    };
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let path = app.path().app_data_dir()?.join("last-url.txt");
+        crate::util::write_last_url(&path, &url)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("[Pake] Could not save the last URL: {error}");
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod proxy_arg_tests {
+    use super::*;
+
+    fn parse(url: &str) -> Url {
+        Url::from_str(url).unwrap()
+    }
+
+    #[test]
+    fn http_url_with_explicit_port() {
+        let arg = build_proxy_browser_arg(&parse("http://127.0.0.1:7890")).unwrap();
+        assert_eq!(arg, "--proxy-server=http://127.0.0.1:7890");
+    }
+
+    #[test]
+    fn http_url_uses_default_port_when_missing() {
+        let arg = build_proxy_browser_arg(&parse("http://proxy.local")).unwrap();
+        assert_eq!(arg, "--proxy-server=http://proxy.local:80");
+    }
+
+    #[test]
+    fn socks5_url_uses_default_port_when_missing() {
+        let arg = build_proxy_browser_arg(&parse("socks5://proxy.local")).unwrap();
+        assert_eq!(arg, "--proxy-server=socks5://proxy.local:1080");
+    }
+
+    #[test]
+    fn https_scheme_is_not_supported_yet() {
+        // https proxies fall back to platform proxy_url; we only emit a CLI arg
+        // for http/socks5 today.
+        assert!(build_proxy_browser_arg(&parse("https://proxy.local:8443")).is_none());
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[cfg(feature = "native-download-probe")]
+#[path = "native_download_smoke.rs"]
+mod native_download_smoke;
+
+/// Whether the app's extensions load in this webview: on Windows whenever the
+/// app carries one, on macOS only from 15.4, where WebKit runs them.
+fn extensions_run(config: &PakeConfig) -> bool {
+    if config.runtime_extensions.is_none() {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    return crate::app::extensions::supported();
+    #[cfg(target_os = "windows")]
+    return true;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    return false;
+}
+
+/// `window.pakeConfig` for the page. An extension that restyles the site turns
+/// the runtime's own tweaks off (`site_styles`), but where it does not run they
+/// stay, so the site never ends up with neither.
+///
+/// `page_popup` marks a window a page opened, such as a sign-in popup: it is
+/// not the app's window, so the shortcut that goes home leaves it alone.
+fn page_config(window_config: &WindowConfig, extensions_run: bool, page_popup: bool) -> String {
+    let mut value = serde_json::to_value(window_config).unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        if !extensions_run {
+            object.insert("site_styles".into(), true.into());
+        }
+        if page_popup {
+            object.insert("page_popup".into(), true.into());
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod site_style_tests {
+    use super::page_config;
+    use crate::app::config::PakeConfig;
+
+    #[test]
+    fn site_styles_turn_off_only_where_extensions_run() {
+        let config: PakeConfig = serde_json::from_str(include_str!("../../pake.json")).unwrap();
+        let mut window = config.windows[0].clone();
+        window.site_styles = false;
+        let page = |run| {
+            serde_json::from_str::<serde_json::Value>(&page_config(&window, run, false)).unwrap()
+        };
+        assert_eq!(page(true)["site_styles"], false);
+        assert_eq!(page(false)["site_styles"], true);
+        assert!(page(true).get("page_popup").is_none());
+        let popup: serde_json::Value =
+            serde_json::from_str(&page_config(&window, true, true)).unwrap();
+        assert_eq!(popup["page_popup"], true);
+    }
+}
