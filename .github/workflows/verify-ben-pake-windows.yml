@@ -1,0 +1,204 @@
+name: Verify Ben-Pake Windows MSI
+
+env:
+  NODE_VERSION: "22"
+  PNPM_VERSION: "10.26.2"
+
+on:
+  push:
+    branches: [ben-pake-windows-verification]
+
+# Builds an app on demand for anyone who runs it; it writes nothing.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: windows-latest
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js Environment
+        uses: ./.github/actions/setup-env
+        with:
+          mode: build
+
+      - name: Build CLI
+        run: pnpm run cli:build
+
+      - name: Setup mold linker
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+
+      - name: Build App (Linux/macOS)
+        if: runner.os != 'Windows'
+        timeout-minutes: 25
+        shell: bash
+        env:
+          INPUT_URL: https://example.com
+          INPUT_NAME: Ben-Pake Example V2
+        run: |
+          ARGS=("$INPUT_URL" "--name" "$INPUT_NAME")
+
+          if [ -n "$INPUT_ICON" ]; then
+            ARGS+=("--icon" "$INPUT_ICON")
+          fi
+
+          if [ -n "$INPUT_WIDTH" ]; then
+            ARGS+=("--width" "$INPUT_WIDTH")
+          fi
+
+          if [ -n "$INPUT_HEIGHT" ]; then
+            ARGS+=("--height" "$INPUT_HEIGHT")
+          fi
+
+          if [ -n "$INPUT_MIN_WIDTH" ]; then
+            ARGS+=("--min-width" "$INPUT_MIN_WIDTH")
+          fi
+
+          if [ -n "$INPUT_MIN_HEIGHT" ]; then
+            ARGS+=("--min-height" "$INPUT_MIN_HEIGHT")
+          fi
+
+          if [ -n "$INPUT_APP_VERSION" ]; then
+            ARGS+=("--app-version" "$INPUT_APP_VERSION")
+          fi
+
+          if [ "$INPUT_FULLSCREEN" == "true" ]; then
+            ARGS+=("--fullscreen")
+          fi
+
+          if [ "$INPUT_HIDE_TITLE_BAR" == "true" ]; then
+            ARGS+=("--hide-title-bar")
+          fi
+
+          if [ "$INPUT_NEW_WINDOW" == "true" ]; then
+            ARGS+=("--new-window")
+          fi
+
+          if [ "$INPUT_MULTI_ARCH" == "true" ]; then
+            ARGS+=("--multi-arch")
+          fi
+
+          if [ -n "$INPUT_TARGETS" ] && [ "$RUNNER_OS" == "Linux" ]; then
+            ARGS+=("--targets" "$INPUT_TARGETS")
+          fi
+
+          printf 'Running: node dist/cli.js'
+          printf ' %q' "${ARGS[@]}"
+          printf '\n'
+          node dist/cli.js "${ARGS[@]}"
+
+      - name: Build App (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 25
+        shell: pwsh
+        env:
+          INPUT_URL: https://example.com
+          INPUT_NAME: Ben-Pake Example V2
+        run: |
+          $args = $env:INPUT_URL, "--name", $env:INPUT_NAME
+
+          # Empty environment variables are unset on Windows, so test for null too.
+          if (-not [string]::IsNullOrEmpty($env:INPUT_ICON)) {
+            $args += "--icon", $env:INPUT_ICON
+          }
+
+          if (-not [string]::IsNullOrEmpty($env:INPUT_WIDTH)) {
+            $args += "--width", $env:INPUT_WIDTH
+          }
+
+          if (-not [string]::IsNullOrEmpty($env:INPUT_HEIGHT)) {
+            $args += "--height", $env:INPUT_HEIGHT
+          }
+
+          if (-not [string]::IsNullOrEmpty($env:INPUT_MIN_WIDTH)) {
+            $args += "--min-width", $env:INPUT_MIN_WIDTH
+          }
+
+          if (-not [string]::IsNullOrEmpty($env:INPUT_MIN_HEIGHT)) {
+            $args += "--min-height", $env:INPUT_MIN_HEIGHT
+          }
+
+          if (-not [string]::IsNullOrEmpty($env:INPUT_APP_VERSION)) {
+            $args += "--app-version", $env:INPUT_APP_VERSION
+          }
+
+          if ($env:INPUT_FULLSCREEN -eq "true") {
+            $args += "--fullscreen"
+          }
+
+          if ($env:INPUT_HIDE_TITLE_BAR -eq "true") {
+            $args += "--hide-title-bar"
+          }
+
+          if ($env:INPUT_NEW_WINDOW -eq "true") {
+            $args += "--new-window"
+          }
+
+          Write-Host "Running: node dist/cli.js $($args -join ' ')"
+          node dist/cli.js @args --targets x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git checkout -- src-tauri/Cargo.lock
+
+      - name: Upload DMG (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v6
+        with:
+          name: Ben-Pake Example V2-macOS
+          path: Ben-Pake Example V2.dmg
+          retention-days: 3
+
+      # The CLI lowercases and hyphenates Linux names, so match packages by extension.
+      - name: Upload DEB (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v6
+        with:
+          name: Ben-Pake Example V2-Linux-deb
+          path: "*.deb"
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Upload AppImage (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v6
+        with:
+          name: Ben-Pake Example V2-Linux-AppImage
+          path: "*.AppImage"
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Upload RPM (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v6
+        with:
+          name: Ben-Pake Example V2-Linux-rpm
+          path: "*.rpm"
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Upload ZST (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v6
+        with:
+          name: Ben-Pake Example V2-Linux-zst
+          path: "*.pkg.tar.zst"
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Upload MSI (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v6
+        with:
+          name: Ben-Pake Example V2-Windows
+          path: Ben-Pake Example V2.msi
+          if-no-files-found: error
+          retention-days: 3
