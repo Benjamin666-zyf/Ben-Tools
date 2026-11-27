@@ -6,14 +6,35 @@ struct BuildFailure: LocalizedError {
     init(_ message: String) { self.message = message }
 }
 
-struct Recipe: Encodable, Sendable {
+struct WebsiteOptions: Encodable, Sendable {
+    var fullscreen = false
+    var hideTitleBar = false
+    var darkMode = false
+    var hideOnClose = true
+    var showSystemTray = false
+    var restoreLastUrl = false
+    var multiWindow = false
+    var newWindow = false
+    var alwaysOnTop = false
+    var incognito = false
+    var startToTray = false
+    var activationShortcut = ""
+    var proxyUrl = ""
+    var userAgent = ""
+}
+
+struct Recipe: Sendable {
     let url: String
     let name: String
     let icon: String?
     let width: Int
     let height: Int
+    let options: WebsiteOptions
+    let styles: String
+    let script: String
 
-    init(url: String, name: String, icon: URL?, width: String, height: String) throws {
+    init(url: String, name: String, icon: URL?, width: String, height: String, options: WebsiteOptions,
+         styles: String, script: String, galleryIcon: String?) throws {
         let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let address = URLComponents(string: url),
               ["http", "https"].contains(address.scheme?.lowercased() ?? ""),
@@ -30,9 +51,30 @@ struct Recipe: Encodable, Sendable {
         }
         self.url = url
         self.name = name
-        self.icon = icon?.path
+        self.icon = icon?.path ?? galleryIcon
         self.width = width
         self.height = height
+        self.options = options
+        self.styles = styles
+        self.script = script
+    }
+
+    func writeConfig(to file: URL) throws {
+        let settings = try JSONEncoder().encode(options)
+        var config = try JSONSerialization.jsonObject(with: settings) as? [String: Any] ?? [:]
+        config["url"] = url
+        config["name"] = name
+        config["icon"] = icon
+        config["width"] = width
+        config["height"] = height
+        var injectionFiles: [String] = []
+        for (name, content) in [("custom.css", styles), ("custom.js", script)] where !content.isEmpty {
+            let source = file.deletingLastPathComponent().appendingPathComponent(name)
+            try content.write(to: source, atomically: true, encoding: .utf8)
+            injectionFiles.append(source.path)
+        }
+        config["inject"] = injectionFiles
+        try JSONSerialization.data(withJSONObject: config).write(to: file)
     }
 }
 
@@ -48,6 +90,9 @@ struct Builder: Sendable {
                      "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
         environment["PATH"] = ([environment["PATH"] ?? ""] + paths)
             .filter { !$0.isEmpty }.joined(separator: ":")
+        let cache = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Caches/Ben-Pake/cargo-target", isDirectory: true)
+        environment["CARGO_TARGET_DIR"] = cache.path
         self.environment = environment
     }
 
@@ -65,7 +110,7 @@ struct Builder: Sendable {
         try files.createDirectory(at: workspace, withIntermediateDirectories: false)
         defer { try? files.removeItem(at: workspace) }
         let config = workspace.appendingPathComponent("app.json")
-        try JSONEncoder().encode(recipe).write(to: config)
+        try recipe.writeConfig(to: config)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -81,6 +126,7 @@ struct Builder: Sendable {
         process.standardOutput = resultWriter
         process.standardError = stderr
         try process.run()
+        try stderr.fileHandleForWriting.close()
 
         let lastLog = try streamLog(stderr.fileHandleForReading, to: log)
         process.waitUntilExit()

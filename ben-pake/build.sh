@@ -20,6 +20,7 @@ mkdir -p "$app/Contents/MacOS" "$engine"
 tar -xzf "$stage/"pake-cli-*.tgz --strip-components=1 -C "$engine"
 cp "$repo/package.json" "$repo/pnpm-lock.yaml" "$repo/.npmrc" "$repo/rust-toolchain.toml" "$engine/"
 (cd "$engine" && pnpm install --prod --frozen-lockfile)
+cp -R "$repo/gallery/apps" "$app/Contents/Resources/gallery"
 cp "$desktop_dir/Info.plist" "$app/Contents/"
 swiftc -target arm64-apple-macos14.0 -swift-version 6 -parse-as-library -O \
   "$desktop_dir/BenPake.swift" "$desktop_dir/Builder.swift" -o "$app/Contents/MacOS/Ben-Pake"
