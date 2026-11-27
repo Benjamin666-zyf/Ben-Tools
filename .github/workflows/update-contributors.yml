@@ -13,6 +13,7 @@ concurrency:
 
 jobs:
   update-contributors:
+    if: github.repository == 'tw93/Pake'
     runs-on: ubuntu-latest
     permissions:
       contents: write
